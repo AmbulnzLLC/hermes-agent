@@ -27,6 +27,7 @@ import html
 import json
 import logging
 import os
+import re
 import time
 from collections import OrderedDict
 from typing import Any, Dict, Optional
@@ -680,6 +681,26 @@ async def _standalone_send(
 check_teams_requirements = check_requirements
 
 
+_HOSTED_CONTENT_RE = re.compile(
+    r"/hostedContents/([^/?#]+)(?:/\$value)?(?:[?#]|$)",
+    re.IGNORECASE,
+)
+
+
+def _parse_hosted_content_id(url: str) -> Optional[str]:
+    """Extract the hostedContents/{id} fragment from a Teams URL.
+
+    Returns the opaque id that Graph's
+    /teams/{team}/channels/{channel}/messages/{msg}/hostedContents/{id}
+    endpoint expects, or None when the URL isn't shaped that way
+    (e.g. a SharePoint file-upload URL — those have no Graph fallback).
+    """
+    if not url:
+        return None
+    match = _HOSTED_CONTENT_RE.search(url)
+    return match.group(1) if match else None
+
+
 class TeamsAdapter(BasePlatformAdapter):
     """Microsoft Teams adapter using the microsoft-teams-apps SDK."""
 
@@ -900,6 +921,20 @@ class TeamsAdapter(BasePlatformAdapter):
         attachments = getattr(activity, "attachments", None) or []
         logger.info("[teams][attach] received %d attachment(s)", len(attachments))
 
+        # Context for Graph hostedContents fallback. Channel attachments
+        # (not DM uploads) carry team_id + channel_id under channel_data;
+        # without all three of (team, channel, activity_id) the fallback
+        # cannot address the blob and we just take the direct-failure path.
+        channel_data = getattr(activity, "channel_data", None) or {}
+        graph_team_id: Optional[str] = None
+        graph_channel_id: Optional[str] = None
+        graph_activity_id: str = str(getattr(activity, "id", "") or "")
+        if isinstance(channel_data, dict):
+            team_block = channel_data.get("team") or {}
+            channel_block = channel_data.get("channel") or {}
+            graph_team_id = team_block.get("id")
+            graph_channel_id = channel_block.get("id")
+
         for idx, att in enumerate(attachments):
             content_url = getattr(att, "content_url", None) or getattr(att, "contentUrl", None)
             content_type = (getattr(att, "content_type", None) or getattr(att, "contentType", None) or "").lower()
@@ -915,6 +950,17 @@ class TeamsAdapter(BasePlatformAdapter):
                     logger.info("[teams][attach][%d] dispatch=image_url", idx)
                     cached = await cache_image_from_url(content_url)
                     logger.info("[teams][attach][%d] cache_image_from_url -> %r", idx, cached)
+                    if cached is None:
+                        cached = await self._try_graph_hosted_fallback(
+                            idx=idx,
+                            url=content_url,
+                            team_id=graph_team_id,
+                            channel_id=graph_channel_id,
+                            activity_id=graph_activity_id,
+                            kind="image",
+                            ext=".jpg",  # default — most hosted contents are jpegs
+                            filename=att_name,
+                        )
                     if cached:
                         media_urls.append(cached)
                         media_types.append(content_type)
@@ -982,11 +1028,23 @@ class TeamsAdapter(BasePlatformAdapter):
                             )
                             if resp.status != 200:
                                 logger.warning(
-                                    "[teams][attach][%d] tempauth GET %s returned %s",
+                                    "[teams][attach][%d] tempauth GET %s returned %s — trying Graph fallback",
                                     idx, filename, resp.status,
                                 )
-                                continue
-                            data = await resp.read()
+                                data = await self._try_graph_hosted_bytes(
+                                    url=download_url,
+                                    team_id=graph_team_id,
+                                    channel_id=graph_channel_id,
+                                    activity_id=graph_activity_id,
+                                )
+                                if data is None:
+                                    logger.warning(
+                                        "[teams][attach][%d] Graph fallback also failed for %s",
+                                        idx, filename,
+                                    )
+                                    continue
+                            else:
+                                data = await resp.read()
                     logger.info("[teams][attach][%d] tempauth body len=%d bytes", idx, len(data))
 
                     if file_type in _IMAGE_EXTS:
@@ -1742,6 +1800,94 @@ class TeamsAdapter(BasePlatformAdapter):
             )
             self._graph = GraphClient(self._token_provider)
         return self._graph
+
+    async def _try_graph_hosted_bytes(
+        self,
+        *,
+        url: str,
+        team_id: Optional[str],
+        channel_id: Optional[str],
+        activity_id: str,
+    ) -> Optional[bytes]:
+        """Best-effort Graph hostedContents retrieval.
+
+        Returns the bytes on success, None on every failure path
+        (missing context, no hostedContents id in the URL, Graph
+        SDK not installed, Graph call raised, or Graph returned no
+        data). Callers fall through to whatever the direct path
+        produced (which may also be None — that's fine, the
+        attachment is just dropped at the higher level).
+        """
+        hosted_id = _parse_hosted_content_id(url)
+        if not (hosted_id and team_id and channel_id and activity_id):
+            return None
+        try:
+            graph = await self._ensure_graph()
+        except Exception as exc:
+            logger.warning(
+                "[teams][graph-fallback] Graph not available: %s", exc,
+            )
+            return None
+        if graph is None:
+            return None
+        try:
+            data = await graph.download_hosted_content(
+                team_id=team_id,
+                channel_id=channel_id,
+                message_id=activity_id,
+                hosted_content_id=hosted_id,
+            )
+        except Exception:
+            logger.exception(
+                "[teams][graph-fallback] download_hosted_content raised "
+                "for msg=%s hc=%s", activity_id, hosted_id,
+            )
+            return None
+        if data is not None:
+            logger.info(
+                "[teams][graph-fallback] recovered %d bytes via Graph "
+                "hostedContents (msg=%s, hc=%s)",
+                len(data), activity_id, hosted_id,
+            )
+        return data
+
+    async def _try_graph_hosted_fallback(
+        self,
+        *,
+        idx: int,
+        url: str,
+        team_id: Optional[str],
+        channel_id: Optional[str],
+        activity_id: str,
+        kind: str,                 # "image" — only image path uses this v1
+        ext: str,
+        filename: Optional[str] = None,
+    ) -> Optional[str]:
+        """Attempt Graph hostedContents fallback then cache the bytes.
+
+        Image-path entry point. Returns a cached file path on
+        success, None on failure. Documents from the file.download.info
+        branch use _try_graph_hosted_bytes directly (they need to
+        fan out to image / audio / video / doc caches based on
+        file_type, which the caller already has).
+        """
+        data = await self._try_graph_hosted_bytes(
+            url=url,
+            team_id=team_id,
+            channel_id=channel_id,
+            activity_id=activity_id,
+        )
+        if data is None:
+            return None
+        try:
+            from gateway.platforms.base import cache_image_from_bytes
+            return cache_image_from_bytes(data, ext=ext)
+        except Exception:
+            logger.exception(
+                "[teams][graph-fallback][%d] cache failed for %r",
+                idx, filename,
+            )
+            return None
 
     async def _send_attachment(
         self,
