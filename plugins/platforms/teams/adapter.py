@@ -95,7 +95,11 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    SUPPORTED_DOCUMENT_TYPES,
+    cache_audio_from_url,
+    cache_document_from_bytes,
     cache_image_from_url,
+    cache_video_from_url,
 )
 
 logger = logging.getLogger(__name__)
@@ -384,8 +388,61 @@ class _AiohttpBridgeAdapter:
 
 
 def check_requirements() -> bool:
-    """Return True when all Teams dependencies and credentials are present."""
-    return TEAMS_SDK_AVAILABLE and AIOHTTP_AVAILABLE
+    """Return True when all Teams dependencies and credentials are present.
+
+    Lazy-installs microsoft-teams-apps via ``tools.lazy_deps.ensure("platform.teams")``
+    on first call if not present, following the same pattern as check_slack_requirements().
+    """
+    global TEAMS_SDK_AVAILABLE, AIOHTTP_AVAILABLE, web
+    global App, ActivityContext, ClientOptions, MessageActivity, ConversationReference
+    global TypingActivityInput, AdaptiveCardInvokeActivity
+    global AdaptiveCardActionCardResponse, AdaptiveCardActionMessageResponse
+    global InvokeResponse, AdaptiveCardInvokeResponse
+    global HttpMethod, HttpRequest, HttpResponse, HttpRouteHandler
+    global AdaptiveCard, ExecuteAction, TextBlock
+
+    if TEAMS_SDK_AVAILABLE and AIOHTTP_AVAILABLE:
+        return True
+    try:
+        from tools.lazy_deps import ensure as _lazy_ensure
+        _lazy_ensure("platform.teams", prompt=False)
+    except Exception:
+        return False
+    try:
+        from aiohttp import web as _web
+        from microsoft_teams.apps import App as _App, ActivityContext as _ActivityContext
+        from microsoft_teams.common.http.client import ClientOptions as _ClientOptions
+        from microsoft_teams.api import MessageActivity as _MessageActivity, ConversationReference as _ConversationReference
+        from microsoft_teams.api.activities.typing import TypingActivityInput as _TypingActivityInput
+        from microsoft_teams.api.activities.invoke.adaptive_card import AdaptiveCardInvokeActivity as _AdaptiveCardInvokeActivity
+        from microsoft_teams.api.models.adaptive_card import (
+            AdaptiveCardActionCardResponse as _AdaptiveCardActionCardResponse,
+            AdaptiveCardActionMessageResponse as _AdaptiveCardActionMessageResponse,
+        )
+        from microsoft_teams.api.models.invoke_response import InvokeResponse as _InvokeResponse, AdaptiveCardInvokeResponse as _AdaptiveCardInvokeResponse
+        from microsoft_teams.apps.http.adapter import (
+            HttpMethod as _HttpMethod,
+            HttpRequest as _HttpRequest,
+            HttpResponse as _HttpResponse,
+            HttpRouteHandler as _HttpRouteHandler,
+        )
+        from microsoft_teams.cards import AdaptiveCard as _AdaptiveCard, ExecuteAction as _ExecuteAction, TextBlock as _TextBlock
+    except ImportError:
+        return False
+    web = _web
+    App, ActivityContext, ClientOptions = _App, _ActivityContext, _ClientOptions
+    MessageActivity, ConversationReference = _MessageActivity, _ConversationReference
+    TypingActivityInput = _TypingActivityInput
+    AdaptiveCardInvokeActivity = _AdaptiveCardInvokeActivity
+    AdaptiveCardActionCardResponse = _AdaptiveCardActionCardResponse
+    AdaptiveCardActionMessageResponse = _AdaptiveCardActionMessageResponse
+    InvokeResponse, AdaptiveCardInvokeResponse = _InvokeResponse, _AdaptiveCardInvokeResponse
+    HttpMethod, HttpRequest = _HttpMethod, _HttpRequest
+    HttpResponse, HttpRouteHandler = _HttpResponse, _HttpRouteHandler
+    AdaptiveCard, ExecuteAction, TextBlock = _AdaptiveCard, _ExecuteAction, _TextBlock
+    AIOHTTP_AVAILABLE = True
+    TEAMS_SDK_AVAILABLE = True
+    return True
 
 
 def validate_config(config) -> bool:
@@ -770,22 +827,180 @@ class TeamsAdapter(BasePlatformAdapter):
             guild_id=getattr(conv, "tenant_id", None) or self._tenant_id,
         )
 
-        # Handle image attachments
+        # Handle inbound attachments — images, audio, video, and documents.
+        #
+        # Teams delivers attachments in two shapes:
+        #   1. ``content_type: "image/<sub>"`` (or "audio/...", "video/...") with
+        #      a Bot Framework URL in ``content_url``. These can be cached
+        #      directly from the URL.
+        #   2. ``content_type: "application/vnd.microsoft.teams.file.download.info"``
+        #      — file uploads from the Teams web/desktop client. The real
+        #      filename and download URL live in ``content`` (a SharePoint
+        #      tempauth URL — Authorization header MUST be omitted on the GET
+        #      or it returns 401). We fetch the bytes ourselves and route to
+        #      the appropriate cache_* helper based on file extension.
         media_urls = []
         media_types = []
-        for att in getattr(activity, "attachments", None) or []:
-            content_url = getattr(att, "content_url", None)
-            content_type = getattr(att, "content_type", None) or ""
-            if content_url and content_type.startswith("image/"):
-                try:
+        msg_type_override: Optional[MessageType] = None  # set by first non-image/non-text attachment
+        _IMAGE_EXTS = {"png", "jpg", "jpeg", "gif", "webp"}
+        _AUDIO_EXTS = {"mp3", "ogg", "wav", "m4a", "aac", "flac"}
+        _VIDEO_EXTS = {"mp4", "mov", "webm", "mkv", "avi"}
+        _DOC_EXT_TO_MIME = {
+            ext.lstrip("."): mime for ext, mime in SUPPORTED_DOCUMENT_TYPES.items()
+        }
+
+        attachments = getattr(activity, "attachments", None) or []
+        logger.info("[teams][attach] received %d attachment(s)", len(attachments))
+
+        for idx, att in enumerate(attachments):
+            content_url = getattr(att, "content_url", None) or getattr(att, "contentUrl", None)
+            content_type = (getattr(att, "content_type", None) or getattr(att, "contentType", None) or "").lower()
+            att_name = getattr(att, "name", None)
+            logger.info(
+                "[teams][attach][%d] content_type=%r name=%r content_url=%r has_content=%s",
+                idx, content_type, att_name, content_url, getattr(att, "content", None) is not None,
+            )
+
+            try:
+                # ── Shape 1: classic content_url with image/audio/video MIME ─
+                if content_url and content_type.startswith("image/"):
+                    logger.info("[teams][attach][%d] dispatch=image_url", idx)
                     cached = await cache_image_from_url(content_url)
+                    logger.info("[teams][attach][%d] cache_image_from_url -> %r", idx, cached)
                     if cached:
                         media_urls.append(cached)
                         media_types.append(content_type)
-                except Exception as e:
-                    logger.warning("[teams] Failed to cache image attachment: %s", e)
+                    continue
+                if content_url and content_type.startswith("audio/"):
+                    ext = "." + (content_type.split("/", 1)[1].split(";")[0].strip() or "ogg")
+                    logger.info("[teams][attach][%d] dispatch=audio_url ext=%s", idx, ext)
+                    cached = await cache_audio_from_url(content_url, ext=ext)
+                    logger.info("[teams][attach][%d] cache_audio_from_url -> %r", idx, cached)
+                    if cached:
+                        media_urls.append(cached)
+                        media_types.append(content_type)
+                        msg_type_override = msg_type_override or MessageType.VOICE
+                    continue
+                if content_url and content_type.startswith("video/"):
+                    ext = "." + (content_type.split("/", 1)[1].split(";")[0].strip() or "mp4")
+                    logger.info("[teams][attach][%d] dispatch=video_url ext=%s", idx, ext)
+                    cached = await cache_video_from_url(content_url, ext=ext)
+                    logger.info("[teams][attach][%d] cache_video_from_url -> %r", idx, cached)
+                    if cached:
+                        media_urls.append(cached)
+                        media_types.append(content_type)
+                        msg_type_override = msg_type_override or MessageType.VIDEO
+                    continue
 
-        msg_type = MessageType.PHOTO if media_urls else MessageType.TEXT
+                # ── Shape 2: file.download.info ─────────────────────────────
+                if content_type == "application/vnd.microsoft.teams.file.download.info":
+                    logger.info("[teams][attach][%d] dispatch=file.download.info", idx)
+                    content_block = getattr(att, "content", None) or {}
+                    # Bot Framework SDK delivers `content` as either a dict or
+                    # a typed object — handle both.
+                    def _field(obj, *names):
+                        for n in names:
+                            if isinstance(obj, dict):
+                                v = obj.get(n)
+                            else:
+                                v = getattr(obj, n, None)
+                            if v is not None:
+                                return v
+                        return None
+
+                    file_type = str(_field(content_block, "file_type", "fileType") or "").lower().lstrip(".")
+                    download_url = str(_field(content_block, "download_url", "downloadUrl") or "")
+                    filename = str(getattr(att, "name", None) or "").strip() or f"attachment.{file_type or 'bin'}"
+                    logger.info(
+                        "[teams][attach][%d] file.download.info parsed: filename=%r file_type=%r download_url=%r",
+                        idx, filename, file_type, download_url,
+                    )
+
+                    if not download_url or not file_type:
+                        logger.info(
+                            "[teams][attach][%d] DROP missing fields (name=%r, file_type=%r, has_url=%s)",
+                            idx, filename, file_type, bool(download_url),
+                        )
+                        continue
+
+                    # SharePoint tempauth URLs reject the Authorization header — fetch raw.
+                    import aiohttp as _aiohttp
+                    timeout = _aiohttp.ClientTimeout(total=60)
+                    async with _aiohttp.ClientSession(timeout=timeout) as sess:
+                        async with sess.get(download_url) as resp:
+                            logger.info(
+                                "[teams][attach][%d] tempauth GET %s -> status=%s",
+                                idx, filename, resp.status,
+                            )
+                            if resp.status != 200:
+                                logger.warning(
+                                    "[teams][attach][%d] tempauth GET %s returned %s",
+                                    idx, filename, resp.status,
+                                )
+                                continue
+                            data = await resp.read()
+                    logger.info("[teams][attach][%d] tempauth body len=%d bytes", idx, len(data))
+
+                    if file_type in _IMAGE_EXTS:
+                        logger.info("[teams][attach][%d] dispatch=image_bytes ext=%s", idx, file_type)
+                        # Treat as image — no _from_url helper needed since we have bytes.
+                        from gateway.platforms.base import cache_image_from_bytes
+                        cached = cache_image_from_bytes(data, ext="." + file_type)
+                        logger.info("[teams][attach][%d] cache_image_from_bytes -> %r", idx, cached)
+                        media_urls.append(cached)
+                        media_types.append(f"image/{file_type if file_type != 'jpg' else 'jpeg'}")
+                    elif file_type in _AUDIO_EXTS:
+                        logger.info("[teams][attach][%d] dispatch=audio_bytes ext=%s", idx, file_type)
+                        from gateway.platforms.base import cache_audio_from_bytes
+                        cached = cache_audio_from_bytes(data, ext="." + file_type)
+                        logger.info("[teams][attach][%d] cache_audio_from_bytes -> %r", idx, cached)
+                        media_urls.append(cached)
+                        media_types.append(f"audio/{file_type}")
+                        msg_type_override = msg_type_override or MessageType.VOICE
+                    elif file_type in _VIDEO_EXTS:
+                        logger.info("[teams][attach][%d] dispatch=video_bytes ext=%s", idx, file_type)
+                        from gateway.platforms.base import cache_video_from_bytes
+                        cached = cache_video_from_bytes(data, ext="." + file_type)
+                        logger.info("[teams][attach][%d] cache_video_from_bytes -> %r", idx, cached)
+                        media_urls.append(cached)
+                        media_types.append(f"video/{file_type}")
+                        msg_type_override = msg_type_override or MessageType.VIDEO
+                    elif file_type in _DOC_EXT_TO_MIME:
+                        logger.info("[teams][attach][%d] dispatch=document_bytes ext=%s mime=%s", idx, file_type, _DOC_EXT_TO_MIME[file_type])
+                        cached = cache_document_from_bytes(data, filename)
+                        logger.info("[teams][attach][%d] cache_document_from_bytes -> %r", idx, cached)
+                        media_urls.append(cached)
+                        media_types.append(_DOC_EXT_TO_MIME[file_type])
+                        msg_type_override = msg_type_override or MessageType.DOCUMENT
+                    else:
+                        logger.info(
+                            "[teams][attach][%d] DROP unsupported file_type (file_type=%r, name=%r)",
+                            idx, file_type, filename,
+                        )
+                    continue
+
+                # ── Fell through every branch ────────────────────────────────
+                logger.info(
+                    "[teams][attach][%d] DROP unhandled (content_type=%r, has_url=%s)",
+                    idx, content_type, bool(content_url),
+                )
+            except Exception as e:
+                logger.warning("[teams][attach][%d] EXCEPTION (content_type=%s): %s", idx, content_type, e)
+
+        logger.info(
+            "[teams][attach] done: %d cached, types=%r, msg_override=%r",
+            len(media_urls), media_types, msg_type_override,
+        )
+
+        # Image always wins over other media for downstream classification —
+        # the vision pipeline is the most useful interpretation when the user
+        # sent both an image and (e.g.) a document in the same message.
+        if any(t.startswith("image/") for t in media_types):
+            msg_type = MessageType.PHOTO
+        elif msg_type_override is not None:
+            msg_type = msg_type_override
+        else:
+            msg_type = MessageType.TEXT
 
         event = MessageEvent(
             text=text,
