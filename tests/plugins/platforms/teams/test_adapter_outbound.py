@@ -464,3 +464,385 @@ def test_register_pending_upload_sets_timestamp(adapter):
     assert "ts" in entry
     assert isinstance(entry["ts"], float)
     assert before <= entry["ts"] <= after
+
+
+# ---------------------------------------------------------------------------
+# fileConsent/invoke handler — Allow / Decline lifecycle (Task 7)
+# ---------------------------------------------------------------------------
+
+
+def _make_consent_activity(
+    *,
+    action: str = "accept",
+    context: object = None,
+    upload_info=None,
+):
+    """Build a minimal FileConsentInvokeActivity for handler tests.
+
+    Uses ``model_construct`` to skip pydantic validation — the activity
+    in production carries a full Bot Framework envelope (from_, conversation,
+    id, recipient) that's irrelevant to the handler logic we're exercising.
+    """
+    from microsoft_teams.api.activities.invoke.file_consent import (
+        FileConsentInvokeActivity,
+    )
+    from microsoft_teams.api.models import FileConsentCardResponse
+
+    response = FileConsentCardResponse.model_construct(
+        action=action,
+        context=context,
+        upload_info=upload_info,
+    )
+    return FileConsentInvokeActivity.model_construct(value=response)
+
+
+def _make_ctx(activity):
+    """Wrap an activity in the minimal ``ctx`` shape the handler reads."""
+    ctx = MagicMock()
+    ctx.activity = activity
+    return ctx
+
+
+@pytest.fixture
+def mock_aiohttp_put(monkeypatch):
+    """Patch aiohttp.ClientSession to capture PUT calls and return a
+    configurable status. Returns a recorder dict that tests can mutate
+    (status, body) and inspect (calls).
+    """
+    recorder: dict = {"status": 200, "body": "", "calls": [], "raise_on_put": None}
+
+    class _MockResp:
+        def __init__(self, status, body):
+            self.status, self._body = status, body
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return False
+
+        async def text(self):
+            return self._body
+
+    class _MockSession:
+        def __init__(self):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return False
+
+        def put(self, url, data=None, headers=None):
+            recorder["calls"].append(
+                {"url": url, "data": data, "headers": headers}
+            )
+            if recorder["raise_on_put"] is not None:
+                raise recorder["raise_on_put"]
+            return _MockResp(recorder["status"], recorder["body"])
+
+    import aiohttp
+
+    monkeypatch.setattr(aiohttp, "ClientSession", _MockSession)
+    return recorder
+
+
+def _register(adapter, upload_id: str, *, filename="r.pdf", data=b"PDFCONTENT", chat_id="dm:user1"):
+    adapter._register_pending_upload(
+        upload_id,
+        {
+            "filename": filename,
+            "bytes": data,
+            "chat_id": chat_id,
+            "caption": None,
+            "reply_to": None,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_file_consent_invoke_decline_pops_entry_no_put(
+    adapter, mock_aiohttp_put, caplog
+):
+    _register(adapter, "u1")
+    activity = _make_consent_activity(
+        action="decline", context={"upload_id": "u1"}
+    )
+
+    with caplog.at_level(logging.INFO, logger="plugins.platforms.teams.adapter"):
+        result = await adapter._handle_file_consent_invoke(_make_ctx(activity))
+
+    assert result is None
+    assert adapter._pending_uploads == {}
+    assert mock_aiohttp_put["calls"] == []
+    assert any(
+        "declined" in rec.getMessage().lower() for rec in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_file_consent_invoke_unknown_upload_id_logs_and_returns(
+    adapter, mock_aiohttp_put, caplog
+):
+    activity = _make_consent_activity(
+        action="accept", context={"upload_id": "missing"}
+    )
+
+    with caplog.at_level(logging.INFO, logger="plugins.platforms.teams.adapter"):
+        result = await adapter._handle_file_consent_invoke(_make_ctx(activity))
+
+    assert result is None
+    assert mock_aiohttp_put["calls"] == []
+    assert any("unknown upload_id" in rec.getMessage() for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_file_consent_invoke_missing_value_returns_none(
+    adapter, mock_aiohttp_put, caplog
+):
+    from microsoft_teams.api.activities.invoke.file_consent import (
+        FileConsentInvokeActivity,
+    )
+
+    activity = FileConsentInvokeActivity.model_construct(value=None)
+    with caplog.at_level(logging.WARNING, logger="plugins.platforms.teams.adapter"):
+        result = await adapter._handle_file_consent_invoke(_make_ctx(activity))
+
+    assert result is None
+    assert mock_aiohttp_put["calls"] == []
+    assert any("without value" in rec.getMessage() for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_file_consent_invoke_accept_no_upload_url_warns(
+    adapter, mock_aiohttp_put, caplog
+):
+    from microsoft_teams.api.models import FileUploadInfo
+
+    _register(adapter, "u-no-url")
+    upload_info = FileUploadInfo.model_construct(
+        upload_url=None, content_url="https://x/y", unique_id="id1", file_type="pdf"
+    )
+    activity = _make_consent_activity(
+        action="accept",
+        context={"upload_id": "u-no-url"},
+        upload_info=upload_info,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="plugins.platforms.teams.adapter"):
+        result = await adapter._handle_file_consent_invoke(_make_ctx(activity))
+
+    assert result is None
+    # Entry was popped (consumed) even though we couldn't PUT.
+    assert adapter._pending_uploads == {}
+    assert mock_aiohttp_put["calls"] == []
+    assert any(
+        "missing upload_info.upload_url" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_file_consent_invoke_accept_happy_path(
+    adapter, mock_aiohttp_put, monkeypatch
+):
+    from microsoft_teams.api.models import FileUploadInfo
+
+    _register(
+        adapter,
+        "u-happy",
+        filename="r.pdf",
+        data=b"PDFCONTENT",
+        chat_id="dm:user1",
+    )
+    upload_info = FileUploadInfo.model_construct(
+        upload_url="https://onedrive.example/upload-session/123",
+        content_url="https://onedrive.example/files/r.pdf",
+        unique_id="graph-drive-item-abc",
+        file_type="pdf",
+        name="r.pdf",
+    )
+    activity = _make_consent_activity(
+        action="accept",
+        context={"upload_id": "u-happy"},
+        upload_info=upload_info,
+    )
+
+    # Capture the FileInfoCard payload sent via _send_attachment.
+    send_attachment_mock = AsyncMock(return_value=SendResult(success=True, message_id="m1"))
+    monkeypatch.setattr(adapter, "_send_attachment", send_attachment_mock)
+
+    result = await adapter._handle_file_consent_invoke(_make_ctx(activity))
+
+    assert result is None
+    assert adapter._pending_uploads == {}
+
+    # Exactly one PUT, with the expected single-shot OneDrive headers.
+    assert len(mock_aiohttp_put["calls"]) == 1
+    call = mock_aiohttp_put["calls"][0]
+    assert call["url"] == "https://onedrive.example/upload-session/123"
+    assert call["data"] == b"PDFCONTENT"
+    headers = call["headers"]
+    assert headers["Content-Type"] == "application/octet-stream"
+    assert headers["Content-Length"] == "10"
+    assert headers["Content-Range"] == "bytes 0-9/10"
+
+    # FileInfoCard follow-up sent to the same chat_id.
+    send_attachment_mock.assert_awaited_once()
+    args, kwargs = send_attachment_mock.await_args
+    assert args[0] == "dm:user1"
+    card = args[1]
+    assert card["contentType"] == "application/vnd.microsoft.teams.card.file.info"
+    # The Graph drive-item id is echoed through, not a fresh uuid.
+    assert card["content"]["uniqueId"] == "graph-drive-item-abc"
+    assert card["content"]["fileType"] == "pdf"
+
+
+@pytest.mark.asyncio
+async def test_file_consent_invoke_accept_put_500_no_followup(
+    adapter, mock_aiohttp_put, monkeypatch, caplog
+):
+    from microsoft_teams.api.models import FileUploadInfo
+
+    _register(adapter, "u-500")
+    upload_info = FileUploadInfo.model_construct(
+        upload_url="https://onedrive.example/u",
+        content_url="https://x/y",
+        unique_id="id",
+        file_type="pdf",
+    )
+    activity = _make_consent_activity(
+        action="accept",
+        context={"upload_id": "u-500"},
+        upload_info=upload_info,
+    )
+    mock_aiohttp_put["status"] = 500
+    mock_aiohttp_put["body"] = "internal error"
+
+    send_attachment_mock = AsyncMock(return_value=SendResult(success=True))
+    monkeypatch.setattr(adapter, "_send_attachment", send_attachment_mock)
+
+    with caplog.at_level(logging.WARNING, logger="plugins.platforms.teams.adapter"):
+        result = await adapter._handle_file_consent_invoke(_make_ctx(activity))
+
+    assert result is None
+    assert len(mock_aiohttp_put["calls"]) == 1
+    send_attachment_mock.assert_not_awaited()
+    assert any(
+        "PUT failed status=500" in rec.getMessage() for rec in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_file_consent_invoke_accept_put_transport_error_no_followup(
+    adapter, mock_aiohttp_put, monkeypatch, caplog
+):
+    import aiohttp
+    from microsoft_teams.api.models import FileUploadInfo
+
+    _register(adapter, "u-boom")
+    upload_info = FileUploadInfo.model_construct(
+        upload_url="https://onedrive.example/u",
+        content_url="https://x/y",
+        unique_id="id",
+        file_type="pdf",
+    )
+    activity = _make_consent_activity(
+        action="accept",
+        context={"upload_id": "u-boom"},
+        upload_info=upload_info,
+    )
+    mock_aiohttp_put["raise_on_put"] = aiohttp.ClientError("boom")
+
+    send_attachment_mock = AsyncMock(return_value=SendResult(success=True))
+    monkeypatch.setattr(adapter, "_send_attachment", send_attachment_mock)
+
+    with caplog.at_level(logging.WARNING, logger="plugins.platforms.teams.adapter"):
+        result = await adapter._handle_file_consent_invoke(_make_ctx(activity))
+
+    assert result is None
+    send_attachment_mock.assert_not_awaited()
+    assert any(
+        "transport error" in rec.getMessage() for rec in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_file_consent_invoke_accept_followup_failure_logs(
+    adapter, mock_aiohttp_put, monkeypatch, caplog
+):
+    from microsoft_teams.api.models import FileUploadInfo
+
+    _register(adapter, "u-followup")
+    upload_info = FileUploadInfo.model_construct(
+        upload_url="https://onedrive.example/u",
+        content_url="https://x/y",
+        unique_id="id",
+        file_type="pdf",
+    )
+    activity = _make_consent_activity(
+        action="accept",
+        context={"upload_id": "u-followup"},
+        upload_info=upload_info,
+    )
+    # PUT succeeds, but the FileInfoCard send fails.
+    send_attachment_mock = AsyncMock(
+        return_value=SendResult(success=False, error="x", retryable=True)
+    )
+    monkeypatch.setattr(adapter, "_send_attachment", send_attachment_mock)
+
+    with caplog.at_level(logging.WARNING, logger="plugins.platforms.teams.adapter"):
+        result = await adapter._handle_file_consent_invoke(_make_ctx(activity))
+
+    assert result is None
+    send_attachment_mock.assert_awaited_once()
+    assert any(
+        "FileInfoCard follow-up failed" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_file_consent_invoke_evicts_stale_before_lookup(
+    adapter, mock_aiohttp_put
+):
+    from microsoft_teams.api.models import FileUploadInfo
+
+    _register(adapter, "u-stale")
+    # Backdate so the entry is stale by the time the invoke arrives.
+    adapter._pending_uploads["u-stale"]["ts"] = time.monotonic() - 7200
+
+    upload_info = FileUploadInfo.model_construct(
+        upload_url="https://onedrive.example/u",
+        content_url="https://x/y",
+        unique_id="id",
+        file_type="pdf",
+    )
+    activity = _make_consent_activity(
+        action="accept",
+        context={"upload_id": "u-stale"},
+        upload_info=upload_info,
+    )
+    result = await adapter._handle_file_consent_invoke(_make_ctx(activity))
+
+    assert result is None
+    # Eviction happened before lookup → unknown-id path → no PUT.
+    assert mock_aiohttp_put["calls"] == []
+    assert "u-stale" not in adapter._pending_uploads
+
+
+@pytest.mark.asyncio
+async def test_file_consent_invoke_context_not_dict_returns_unknown(
+    adapter, mock_aiohttp_put, caplog
+):
+    activity = _make_consent_activity(
+        action="accept", context="stale-context-from-old-card"
+    )
+
+    with caplog.at_level(logging.INFO, logger="plugins.platforms.teams.adapter"):
+        result = await adapter._handle_file_consent_invoke(_make_ctx(activity))
+
+    assert result is None
+    assert mock_aiohttp_put["calls"] == []
+    assert any("unknown upload_id" in rec.getMessage() for rec in caplog.records)

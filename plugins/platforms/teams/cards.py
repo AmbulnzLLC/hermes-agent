@@ -53,21 +53,34 @@ def build_file_consent_card(
     }
 
 
-def build_file_info_card(filename: str, file_type: str, url: str) -> Dict[str, Any]:
+def build_file_info_card(
+    filename: str,
+    content_url: str,
+    *,
+    unique_id: Optional[str] = None,
+    file_type: Optional[str] = None,
+) -> Dict[str, Any]:
     """Build the FileInfoCard the bot sends *after* a successful FileConsent upload.
 
     Without this, the file does not render as a native attachment in the
-    DM — the user just sees the consent card flip to 'uploaded'. The
-    ``uniqueId`` is always freshly generated; it's purely a client-side
-    handle for the rendered attachment.
+    DM — the user just sees the consent card flip to 'uploaded'.
+
+    ``content_url`` is the OneDrive ``contentUrl`` echoed back in the
+    ``fileConsent/invoke`` ``upload_info``. ``unique_id`` is the OneDrive
+    drive-item id from ``upload_info.unique_id`` — required by Teams
+    clients to render the file as a native preview-able attachment;
+    when omitted, a fresh uuid is generated as a fallback (the file
+    still renders but the link may not resolve to a previewable item).
+    ``file_type`` is auto-inferred from the filename extension when
+    omitted (e.g. ``foo.pdf`` → ``"pdf"``).
     """
     return {
         "contentType": FILE_INFO_CONTENT_TYPE,
-        "contentUrl": url,
+        "contentUrl": content_url,
         "name": filename,
         "content": {
-            "uniqueId": str(uuid.uuid4()),
-            "fileType": file_type,
+            "uniqueId": unique_id or str(uuid.uuid4()),
+            "fileType": file_type or _infer_file_type(filename),
         },
     }
 

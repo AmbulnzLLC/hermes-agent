@@ -55,6 +55,8 @@ try:
     from microsoft_teams.api import MessageActivity, ConversationReference
     from microsoft_teams.api.activities.typing import TypingActivityInput
     from microsoft_teams.api.activities.invoke.adaptive_card import AdaptiveCardInvokeActivity
+    from microsoft_teams.api.activities.invoke.file_consent import FileConsentInvokeActivity
+    from microsoft_teams.api.models import FileUploadInfo
     from microsoft_teams.api.models.adaptive_card import (
         AdaptiveCardActionCardResponse,
         AdaptiveCardActionMessageResponse,
@@ -78,6 +80,8 @@ except ImportError:
     ConversationReference = None  # type: ignore[assignment,misc]
     TypingActivityInput = None  # type: ignore[assignment,misc]
     AdaptiveCardInvokeActivity = None  # type: ignore[assignment,misc]
+    FileConsentInvokeActivity = None  # type: ignore[assignment,misc]
+    FileUploadInfo = None  # type: ignore[assignment,misc]
     AdaptiveCardActionCardResponse = None  # type: ignore[assignment,misc]
     AdaptiveCardActionMessageResponse = None  # type: ignore[assignment,misc]
     AdaptiveCardInvokeResponse = None  # type: ignore[assignment,misc,union-attr]
@@ -398,6 +402,7 @@ def check_requirements() -> bool:
     global TEAMS_SDK_AVAILABLE, AIOHTTP_AVAILABLE, web
     global App, ActivityContext, ClientOptions, MessageActivity, ConversationReference
     global TypingActivityInput, AdaptiveCardInvokeActivity
+    global FileConsentInvokeActivity, FileUploadInfo
     global AdaptiveCardActionCardResponse, AdaptiveCardActionMessageResponse
     global InvokeResponse, AdaptiveCardInvokeResponse
     global HttpMethod, HttpRequest, HttpResponse, HttpRouteHandler
@@ -417,6 +422,8 @@ def check_requirements() -> bool:
         from microsoft_teams.api import MessageActivity as _MessageActivity, ConversationReference as _ConversationReference
         from microsoft_teams.api.activities.typing import TypingActivityInput as _TypingActivityInput
         from microsoft_teams.api.activities.invoke.adaptive_card import AdaptiveCardInvokeActivity as _AdaptiveCardInvokeActivity
+        from microsoft_teams.api.activities.invoke.file_consent import FileConsentInvokeActivity as _FileConsentInvokeActivity
+        from microsoft_teams.api.models import FileUploadInfo as _FileUploadInfo
         from microsoft_teams.api.models.adaptive_card import (
             AdaptiveCardActionCardResponse as _AdaptiveCardActionCardResponse,
             AdaptiveCardActionMessageResponse as _AdaptiveCardActionMessageResponse,
@@ -436,6 +443,8 @@ def check_requirements() -> bool:
     MessageActivity, ConversationReference = _MessageActivity, _ConversationReference
     TypingActivityInput = _TypingActivityInput
     AdaptiveCardInvokeActivity = _AdaptiveCardInvokeActivity
+    FileConsentInvokeActivity = _FileConsentInvokeActivity
+    FileUploadInfo = _FileUploadInfo
     AdaptiveCardActionCardResponse = _AdaptiveCardActionCardResponse
     AdaptiveCardActionMessageResponse = _AdaptiveCardActionMessageResponse
     InvokeResponse, AdaptiveCardInvokeResponse = _InvokeResponse, _AdaptiveCardInvokeResponse
@@ -769,6 +778,12 @@ class TeamsAdapter(BasePlatformAdapter):
                 ctx: ActivityContext[AdaptiveCardInvokeActivity],
             ) -> InvokeResponse[AdaptiveCardActionMessageResponse]:
                 return await self._on_card_action(ctx)
+
+            @self._app.on_file_consent
+            async def _handle_file_consent(
+                ctx: ActivityContext[FileConsentInvokeActivity],
+            ) -> Optional[InvokeResponse[None]]:
+                return await self._handle_file_consent_invoke(ctx)
 
             # initialize() calls register_route() on the bridge, which adds
             # POST /api/messages to aiohttp_app automatically
@@ -1417,6 +1432,154 @@ class TeamsAdapter(BasePlatformAdapter):
             if convo_type:
                 return convo_type == "channel"
         return chat_id.startswith("19:") and "@thread." in chat_id
+
+    async def _handle_file_consent_invoke(
+        self,
+        ctx: "ActivityContext[FileConsentInvokeActivity]",
+    ) -> "Optional[InvokeResponse[None]]":
+        """Resolve a fileConsent/invoke (Allow/Decline) activity.
+
+        Looks up the pending upload by ``context.upload_id``, declines
+        silently or PUTs the bytes to OneDrive on accept, then posts a
+        FileInfoCard so the attachment renders natively in the DM. The
+        pending entry is popped under every exit path so a Teams retry
+        cannot double-handle the upload.
+
+        Always returns None (the SDK auto-acks 200) — fileConsent retries
+        are noisy, and we'd rather log + drop a flaky upload than
+        retry-loop on it.
+        """
+        # Sweep stale pending entries before lookup (mirrors send-side eviction).
+        self._evict_stale_pending_uploads()
+
+        value = ctx.activity.value
+        if value is None:
+            logger.warning("[teams] fileConsent/invoke without value")
+            return None
+
+        # Defensive: context may arrive as a dict, an arbitrary pydantic-
+        # serialised object, or a plain string. Only the dict shape carries
+        # the upload_id we seeded in build_file_consent_card.
+        context = value.context or {}
+        if isinstance(context, dict):
+            upload_id = str(context.get("upload_id") or "")
+        else:
+            upload_id = ""
+
+        pending = self._pending_uploads.pop(upload_id, None) if upload_id else None
+        if pending is None:
+            logger.info(
+                "[teams] fileConsent invoke for unknown upload_id=%r "
+                "(stale card from a previous gateway run, restart between "
+                "send and click, or eviction)",
+                upload_id,
+            )
+            return None
+
+        action = str(getattr(value, "action", "") or "").lower()
+        # Action enum stringifies as "Action.ACCEPT" — fall back to .value.
+        if action.startswith("action."):
+            action = action.split(".", 1)[1]
+        if action != "accept":
+            logger.info(
+                "[teams] fileConsent declined for %s", pending["filename"]
+            )
+            return None
+
+        upload_info = value.upload_info
+        if upload_info is None or not upload_info.upload_url:
+            logger.warning(
+                "[teams] fileConsent/invoke missing upload_info.upload_url for %s",
+                pending["filename"],
+            )
+            return None
+
+        # PUT the bytes to the OneDrive upload session.
+        success = await self._put_consent_bytes(
+            upload_info.upload_url, pending["bytes"]
+        )
+        if not success:
+            return None
+
+        # Post the FileInfoCard so the file renders as a native attachment.
+        await self._post_file_info_card(
+            chat_id=pending["chat_id"],
+            filename=pending["filename"],
+            upload_info=upload_info,
+            caption=pending.get("caption"),
+            reply_to=pending.get("reply_to"),
+        )
+        return None
+
+    async def _put_consent_bytes(self, upload_url: str, data: bytes) -> bool:
+        """PUT *data* to a OneDrive upload-session URL using the
+        single-shot content-range protocol. Returns ``True`` on a 2xx
+        response.
+
+        A fresh ``aiohttp.ClientSession`` is created per call. File
+        uploads are rare and transient so the per-call cost is fine; if
+        throughput becomes a concern we can plumb a shared session
+        through the adapter (upstream caches one on a ``_get_http_session``
+        helper).
+        """
+        try:
+            import aiohttp
+        except ImportError:
+            logger.error("[teams] aiohttp missing; cannot PUT FileConsent bytes")
+            return False
+
+        size = len(data)
+        headers = {
+            "Content-Type": "application/octet-stream",
+            "Content-Length": str(size),
+            "Content-Range": f"bytes 0-{max(size - 1, 0)}/{size}",
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.put(upload_url, data=data, headers=headers) as resp:
+                    if resp.status not in (200, 201):
+                        body = await resp.text()
+                        logger.warning(
+                            "[teams] FileConsent PUT failed status=%d body=%s",
+                            resp.status,
+                            body[:200],
+                        )
+                        return False
+        except aiohttp.ClientError as exc:
+            logger.warning("[teams] FileConsent PUT transport error: %s", exc)
+            return False
+        except Exception:
+            logger.exception("[teams] FileConsent PUT raised")
+            return False
+        return True
+
+    async def _post_file_info_card(
+        self,
+        *,
+        chat_id: str,
+        filename: str,
+        upload_info: "FileUploadInfo",
+        caption: Optional[str],
+        reply_to: Optional[str],
+    ) -> None:
+        """Send the FileInfoCard follow-up after a successful PUT."""
+        from plugins.platforms.teams.cards import build_file_info_card
+
+        card = build_file_info_card(
+            filename=filename,
+            content_url=upload_info.content_url or "",
+            unique_id=upload_info.unique_id,
+            file_type=upload_info.file_type,
+        )
+        result = await self._send_attachment(
+            chat_id, card, caption=caption, reply_to=reply_to
+        )
+        if not result.success:
+            logger.warning(
+                "[teams] FileInfoCard follow-up failed for %s: %s",
+                filename,
+                result.error,
+            )
 
     async def _send_dm_file_consent(
         self,

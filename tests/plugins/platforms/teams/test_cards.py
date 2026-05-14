@@ -89,19 +89,47 @@ def test_file_consent_card_description_defaults_to_empty():
 # ---------------------------------------------------------------------------
 
 def test_file_info_card_uses_correct_content_type():
-    card = build_file_info_card("foo.pdf", file_type="pdf", url="https://example/foo.pdf")
+    card = build_file_info_card(
+        "foo.pdf",
+        content_url="https://example/foo.pdf",
+        unique_id="drive-item-123",
+        file_type="pdf",
+    )
     assert card["contentType"] == FILE_INFO_CONTENT_TYPE
     assert card["contentType"] == "application/vnd.microsoft.teams.card.file.info"
     assert card["contentUrl"] == "https://example/foo.pdf"
     assert card["name"] == "foo.pdf"
     assert card["content"]["fileType"] == "pdf"
-    assert "uniqueId" in card["content"]
+    # When unique_id is supplied (the Graph drive-item id) it is echoed
+    # through unchanged so Teams clients can resolve the attachment.
+    assert card["content"]["uniqueId"] == "drive-item-123"
 
 
-def test_file_info_card_uniqueId_is_fresh():
-    a = build_file_info_card("a.pdf", file_type="pdf", url="https://x/a")
-    b = build_file_info_card("a.pdf", file_type="pdf", url="https://x/a")
+def test_file_info_card_uniqueId_falls_back_to_uuid_when_unknown():
+    # Two cards built without unique_id should each get a fresh uuid
+    # (preserves the old behaviour for callers that don't yet have the
+    # Graph drive-item id).
+    a = build_file_info_card("a.pdf", content_url="https://x/a")
+    b = build_file_info_card("a.pdf", content_url="https://x/a")
     assert a["content"]["uniqueId"] != b["content"]["uniqueId"]
+
+
+def test_file_info_card_passes_unique_id_through():
+    card = build_file_info_card(
+        "report.docx",
+        content_url="https://x/y",
+        unique_id="graph-item-xyz",
+    )
+    assert card["content"]["uniqueId"] == "graph-item-xyz"
+    assert card["name"] == "report.docx"
+
+
+def test_file_info_card_infers_file_type_from_filename():
+    card = build_file_info_card("diagram.PNG", content_url="https://x/y")
+    assert card["content"]["fileType"] == "png"
+    # No extension → "file" fallback.
+    card2 = build_file_info_card("LICENSE", content_url="https://x/y")
+    assert card2["content"]["fileType"] == "file"
 
 
 # ---------------------------------------------------------------------------
