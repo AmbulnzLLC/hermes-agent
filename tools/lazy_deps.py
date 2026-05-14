@@ -122,6 +122,10 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         "slack-sdk==3.40.1",
         "aiohttp==3.13.3",
     ),
+    "platform.teams": (
+        "microsoft-teams-apps==2.0.0",
+        "aiohttp==3.13.3",
+    ),
     "platform.matrix": (
         "mautrix[encryption]==0.21.0",
         "Markdown==3.10.2",
