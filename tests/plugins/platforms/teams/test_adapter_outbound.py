@@ -846,3 +846,91 @@ async def test_file_consent_invoke_context_not_dict_returns_unknown(
     assert result is None
     assert mock_aiohttp_put["calls"] == []
     assert any("unknown upload_id" in rec.getMessage() for rec in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Cross-loop bridge: gateway-loop capture
+#
+# The Microsoft Teams SDK's ``App`` caches asyncio primitives bound to the
+# loop that constructed it. Tools dispatched via model_tools._run_async
+# run on a *worker* loop in a sidecar thread — awaiting App methods from
+# there raises::
+#
+#     RuntimeError: <Event ... [unset]> is bound to a different event loop
+#
+# tools/send_message_tool._send_teams bridges over this by hopping to
+# ``adapter._loop`` via ``asyncio.run_coroutine_threadsafe``. That bridge
+# only works if connect() actually captures the loop. These tests pin the
+# capture/clear contract.
+# ---------------------------------------------------------------------------
+
+
+def test_loop_attribute_is_none_pre_connect(adapter):
+    """Fresh adapter: ``_loop`` is the documented sentinel (None)."""
+    assert adapter._loop is None
+
+
+@pytest.mark.asyncio
+async def test_connect_captures_running_loop(monkeypatch, adapter):
+    """Stub the heavy bits of connect() (App init, aiohttp listener) and
+    confirm the running gateway loop lands in ``self._loop``."""
+    import asyncio as _asyncio
+
+    # Stub out the SDK App + its initialize() coro. The fixture already
+    # filled ``adapter._app`` with a mock; we replace the App() *class*
+    # used inside connect() so the new instance also matches.
+    fake_app = MagicMock()
+    fake_app.initialize = AsyncMock()
+    fake_app.on_message = lambda fn: fn
+    fake_app.on_card_action = lambda fn: fn
+    fake_app.on_file_consent = lambda fn: fn
+
+    monkeypatch.setattr(
+        "plugins.platforms.teams.adapter.App", lambda **kw: fake_app
+    )
+    monkeypatch.setattr(
+        "plugins.platforms.teams.adapter.TEAMS_SDK_AVAILABLE", True
+    )
+    monkeypatch.setattr(
+        "plugins.platforms.teams.adapter.AIOHTTP_AVAILABLE", True
+    )
+
+    # Stub out the aiohttp listener so we don't bind a port.
+    fake_runner = MagicMock()
+    fake_runner.setup = AsyncMock()
+    fake_runner.cleanup = AsyncMock()
+    monkeypatch.setattr(
+        "plugins.platforms.teams.adapter.web.AppRunner", lambda app: fake_runner
+    )
+
+    fake_site = MagicMock()
+    fake_site.start = AsyncMock()
+    monkeypatch.setattr(
+        "plugins.platforms.teams.adapter.web.TCPSite",
+        lambda runner, host, port: fake_site,
+    )
+
+    ok = await adapter.connect()
+    try:
+        assert ok is True
+        assert adapter._loop is _asyncio.get_running_loop(), (
+            "connect() must capture the running event loop so cross-loop "
+            "tool calls can bridge back via run_coroutine_threadsafe"
+        )
+    finally:
+        await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_clears_loop(adapter):
+    """``disconnect()`` clears ``_loop`` so a stale tool call doesn't try
+    to schedule on a torn-down loop."""
+    import asyncio as _asyncio
+
+    # Pretend connect() ran: stamp the loop manually rather than going
+    # through the full stub path.
+    adapter._loop = _asyncio.get_running_loop()
+    adapter._runner = None  # the fixture leaves this unset; disconnect tolerates it
+
+    await adapter.disconnect()
+    assert adapter._loop is None

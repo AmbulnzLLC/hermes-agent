@@ -1796,6 +1796,26 @@ async def _send_teams(chat_id, message, media_files=None, thread_id=None):
     upload would silently fail. Same trap will recur in any future
     Bot-Framework-style adapter (Webex, Zoom Apps, Google Chat).
 
+    Cross-loop bridge
+    -----------------
+    The Microsoft Teams SDK ``App`` is constructed at gateway startup
+    on the gateway's main event loop. It caches ``asyncio.Event`` /
+    ``asyncio.Lock`` primitives that are forever bound to *that* loop.
+
+    Tool calls reach this helper via ``model_tools._run_async``, which
+    — when an outer loop is already running — spawns a fresh worker
+    loop in a sidecar thread and runs the coroutine there. Awaiting
+    ``adapter.send_*`` from that worker loop touches the SDK's
+    loop-bound primitives and raises::
+
+        RuntimeError: <Event ... [unset]> is bound to a different
+        event loop
+
+    Workaround: ``TeamsAdapter.connect()`` records ``self._loop`` (the
+    gateway's loop) and we hop to it via
+    ``asyncio.run_coroutine_threadsafe`` when the call site loop
+    differs.
+
     Architecture writeup: ``hermes-agent-pilot`` skill, reference
     ``outbound-media-wiring-by-send-model.md``.
     """
@@ -1813,10 +1833,39 @@ async def _send_teams(chat_id, message, media_files=None, thread_id=None):
     media_files = media_files or []
     metadata = {"thread_id": thread_id} if thread_id else None
 
+    # Bridge factory: returns an awaitable that runs ``coro`` on the
+    # adapter's loop when one was captured and differs from ours;
+    # otherwise awaits inline. Wrapping every send in this keeps the
+    # cross-loop trap from re-emerging if a new send_* is added later.
+    async def _on_adapter_loop(coro_factory):
+        adapter_loop = getattr(adapter, "_loop", None)
+        # Treat anything that isn't a real running loop as "not captured"
+        # — protects against MagicMock auto-attributes and adapters that
+        # haven't opted in yet.
+        if not isinstance(adapter_loop, asyncio.AbstractEventLoop):
+            return await coro_factory()
+
+        try:
+            current = asyncio.get_running_loop()
+        except RuntimeError:
+            current = None
+
+        if current is adapter_loop or not adapter_loop.is_running():
+            # Same loop, or adapter loop isn't running (test/teardown) —
+            # inline await is correct and avoids a thread hop.
+            return await coro_factory()
+
+        # Cross-loop: schedule on the adapter's loop, await the result
+        # from ours via asyncio.wrap_future.
+        future = asyncio.run_coroutine_threadsafe(coro_factory(), adapter_loop)
+        return await asyncio.wrap_future(future)
+
     try:
         last_result = None
         if message.strip():
-            last_result = await adapter.send(chat_id, message, metadata=metadata)
+            last_result = await _on_adapter_loop(
+                lambda: adapter.send(chat_id, message, metadata=metadata)
+            )
             if not last_result.success:
                 return _error(f"Teams send failed: {last_result.error}")
 
@@ -1826,15 +1875,25 @@ async def _send_teams(chat_id, message, media_files=None, thread_id=None):
 
             ext = os.path.splitext(media_path)[1].lower()
             if ext in _IMAGE_EXTS:
-                last_result = await adapter.send_image_file(chat_id, media_path, metadata=metadata)
+                last_result = await _on_adapter_loop(
+                    lambda p=media_path: adapter.send_image_file(chat_id, p, metadata=metadata)
+                )
             elif ext in _VIDEO_EXTS:
-                last_result = await adapter.send_video(chat_id, media_path, metadata=metadata)
+                last_result = await _on_adapter_loop(
+                    lambda p=media_path: adapter.send_video(chat_id, p, metadata=metadata)
+                )
             elif ext in _VOICE_EXTS and is_voice:
-                last_result = await adapter.send_voice(chat_id, media_path, metadata=metadata)
+                last_result = await _on_adapter_loop(
+                    lambda p=media_path: adapter.send_voice(chat_id, p, metadata=metadata)
+                )
             elif ext in _AUDIO_EXTS:
-                last_result = await adapter.send_voice(chat_id, media_path, metadata=metadata)
+                last_result = await _on_adapter_loop(
+                    lambda p=media_path: adapter.send_voice(chat_id, p, metadata=metadata)
+                )
             else:
-                last_result = await adapter.send_document(chat_id, media_path, metadata=metadata)
+                last_result = await _on_adapter_loop(
+                    lambda p=media_path: adapter.send_document(chat_id, p, metadata=metadata)
+                )
 
             if not last_result.success:
                 return _error(f"Teams media send failed: {last_result.error}")

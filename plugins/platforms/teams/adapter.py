@@ -723,6 +723,11 @@ class TeamsAdapter(BasePlatformAdapter):
         self._port = int(extra.get("port") or os.getenv("TEAMS_PORT", str(_DEFAULT_PORT)))
         self._app: Optional["App"] = None
         self._runner: Optional["web.AppRunner"] = None
+        # Captured in connect() so tools/send_message_tool._send_teams can
+        # bridge cross-loop calls back to the gateway loop the SDK App was
+        # built on. Stays None until connect() succeeds; cleared on
+        # disconnect(). See _send_teams' "Cross-loop bridge" docstring.
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._dedup = MessageDeduplicator(max_size=1000)
         # Maps chat_id → ConversationReference captured from incoming messages.
         # Used to send cards with the correct conversation type (personal/group/channel).
@@ -816,6 +821,12 @@ class TeamsAdapter(BasePlatformAdapter):
             await site.start()
 
             self._running = True
+            # Capture the gateway loop so cross-loop callers (e.g.
+            # tools/send_message_tool._send_teams invoked from the agent's
+            # worker loop) can hop here via run_coroutine_threadsafe. Done
+            # last — only after _app + aiohttp are fully wired so a partial
+            # init never publishes a half-baked loop.
+            self._loop = asyncio.get_running_loop()
             self._mark_connected()
             logger.info(
                 "[teams] Webhook server listening on 0.0.0.0:%d%s",
@@ -839,6 +850,9 @@ class TeamsAdapter(BasePlatformAdapter):
             await self._runner.cleanup()
             self._runner = None
         self._app = None
+        # Clear the captured loop reference so a stale send_message tool
+        # call doesn't try to hop to a loop that's about to close.
+        self._loop = None
         self._mark_disconnected()
         logger.info("[teams] Disconnected")
 
