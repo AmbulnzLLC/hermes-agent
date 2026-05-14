@@ -803,6 +803,64 @@ def cache_video_from_bytes(data: bytes, ext: str = ".mp4") -> str:
     return str(filepath)
 
 
+async def cache_video_from_url(url: str, ext: str = ".mp4", retries: int = 2) -> str:
+    """
+    Download a video file from a URL and save it to the local cache.
+
+    Same pattern as cache_audio_from_url — retries on transient failures.
+
+    Args:
+        url: The HTTP/HTTPS URL to download from.
+        ext: File extension including the dot (e.g. ".mp4", ".mov").
+        retries: Number of retry attempts on transient failures.
+
+    Returns:
+        Absolute path to the cached video file as a string.
+
+    Raises:
+        ValueError: If the URL targets a private/internal network (SSRF protection).
+    """
+    from tools.url_safety import is_safe_url
+    if not is_safe_url(url):
+        raise ValueError(f"Blocked unsafe URL (SSRF protection): {safe_url_for_log(url)}")
+
+    import httpx
+    _log = logging.getLogger(__name__)
+
+    async with httpx.AsyncClient(
+        timeout=60.0,
+        follow_redirects=True,
+        event_hooks={"response": [_ssrf_redirect_guard]},
+    ) as client:
+        for attempt in range(retries + 1):
+            try:
+                response = await client.get(
+                    url,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)",
+                        "Accept": "video/*,*/*;q=0.8",
+                    },
+                )
+                response.raise_for_status()
+                return cache_video_from_bytes(response.content, ext)
+            except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 429:
+                    raise
+                if attempt < retries:
+                    wait = 1.5 * (attempt + 1)
+                    _log.debug(
+                        "Video cache retry %d/%d for %s (%.1fs): %s",
+                        attempt + 1,
+                        retries,
+                        safe_url_for_log(url),
+                        wait,
+                        exc,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                raise
+
+
 # ---------------------------------------------------------------------------
 # Document cache utilities
 #
