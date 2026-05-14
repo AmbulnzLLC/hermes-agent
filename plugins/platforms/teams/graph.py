@@ -65,7 +65,7 @@ class _HermesTokenCredential:
         token = await self._provider.get_token(scopes[0])
         return AccessToken(token, int(time.time()) + 3000)
 
-    async def close(self) -> None:  # pragma: no cover - no-op
+    async def close(self) -> None:
         return None
 
 
@@ -83,7 +83,7 @@ async def _safe(call, *, action: str, default: Any) -> Any:
     try:
         return await call()
     except Exception as exc:  # noqa: BLE001 — broad on purpose
-        log.warning("teams.graph: %s failed: %s", action, exc)
+        log.warning("teams.graph error action=%s err=%s", action, exc)
         return default
 
 

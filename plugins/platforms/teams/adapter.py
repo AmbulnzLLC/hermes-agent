@@ -688,6 +688,27 @@ class TeamsAdapter(BasePlatformAdapter):
         # Used to send cards with the correct conversation type (personal/group/channel).
         self._conv_refs: Dict[str, Any] = {}
 
+        # SharePoint target for outbound channel/group file uploads (Task 6).
+        # Defaults: site_id="" disables channel uploads; folder defaults to
+        # "hermes" so DM-only deployments without SharePoint config still
+        # construct cleanly (channel sends will return a clean error).
+        self._sharepoint_site_id: str = (
+            extra.get("sharepoint_site_id")
+            or os.getenv("TEAMS_SHAREPOINT_SITE_ID", "")
+        )
+        self._sharepoint_folder: str = (
+            extra.get("sharepoint_folder")
+            or os.getenv("TEAMS_SHAREPOINT_FOLDER", "hermes")
+        )
+        # Files awaiting FileConsent acceptance from a DM user — Task 7's
+        # invoke handler drains this dict; Task 6 only fills it. Keyed by
+        # the upload_id seeded into the FileConsent acceptContext.
+        self._pending_uploads: Dict[str, Dict[str, Any]] = {}
+        # Lazy Graph client + token provider; built on first channel send
+        # so DM-only deployments don't pay the msgraph-sdk import cost.
+        self._graph: Any = None
+        self._token_provider: Any = None
+
     async def connect(self) -> bool:
         if not TEAMS_SDK_AVAILABLE:
             self._set_fatal_error(
@@ -1281,6 +1302,259 @@ class TeamsAdapter(BasePlatformAdapter):
             caption=caption,
             reply_to=reply_to,
         )
+
+    # ------------------------------------------------------------------
+    # Outbound files (Task 6) — documents, video, voice
+    #
+    # Teams' wire protocol for file delivery is split:
+    #   • DMs: the bot sends a FileConsentCard, the user clicks accept,
+    #     Teams fires a fileConsent/invoke with a OneDrive upload URL,
+    #     the bot PUTs the bytes there. The accept/invoke handler is
+    #     wired up in Task 7; Task 6 just primes _pending_uploads.
+    #   • Channels / group chats: the bot uploads to a SharePoint
+    #     document library via Microsoft Graph, then sends a
+    #     file.download.info attachment pointing at the resulting
+    #     drive item's webUrl.
+    # ------------------------------------------------------------------
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        # ``file_name`` and ``metadata`` are accepted for parity with the base
+        # class signature; Teams cards always render the on-disk basename and
+        # Teams has no per-message metadata channel like Telegram's.
+        del file_name, metadata
+        return await self._send_local_file(chat_id, file_path, caption, reply_to)
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        del metadata
+        return await self._send_local_file(chat_id, video_path, caption, reply_to)
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        del metadata
+        return await self._send_local_file(chat_id, audio_path, caption, reply_to)
+
+    async def _send_local_file(
+        self,
+        chat_id: str,
+        path: str,
+        caption: Optional[str],
+        reply_to: Optional[str],
+    ) -> SendResult:
+        """Read *path* from disk and dispatch via the right Teams flow."""
+        if not os.path.isfile(path):
+            return SendResult(
+                success=False,
+                error=f"file not found: {path}",
+                retryable=False,
+            )
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            return SendResult(
+                success=False,
+                error=f"could not read file {path}: {e}",
+                retryable=False,
+            )
+        filename = os.path.basename(path)
+        if self._is_channel_chat(chat_id):
+            return await self._send_channel_file(
+                chat_id, filename, data, caption, reply_to
+            )
+        return await self._send_dm_file_consent(
+            chat_id, filename, data, caption, reply_to
+        )
+
+    def _is_channel_chat(self, chat_id: str) -> bool:
+        """Return True if *chat_id* refers to a Teams channel conversation.
+
+        Channel ids are shaped ``19:<groupId>@thread.tacv2`` whereas DMs
+        use ``a:...`` or ``19:<userId>@unq.gbl.spaces``. The id-shape
+        heuristic is necessary for cold-path sends (no inbound activity
+        seen yet) but a stored conversation reference is authoritative
+        when present — Teams tells us the conversation type explicitly.
+        """
+        ref = self._conv_refs.get(chat_id)
+        if ref is not None:
+            convo = getattr(ref, "conversation", None)
+            convo_type = getattr(convo, "conversation_type", None)
+            if convo_type:
+                return convo_type == "channel"
+        return chat_id.startswith("19:") and "@thread." in chat_id
+
+    async def _send_dm_file_consent(
+        self,
+        chat_id: str,
+        filename: str,
+        data: bytes,
+        caption: Optional[str],
+        reply_to: Optional[str],
+    ) -> SendResult:
+        """Send a FileConsentCard and remember the bytes for the invoke handler."""
+        from plugins.platforms.teams.cards import build_file_consent_card
+
+        size = len(data)
+        accept_ctx = {"filename": filename, "service_url_chat_id": chat_id}
+        card = build_file_consent_card(
+            filename=filename,
+            size_bytes=size,
+            description=caption or f"Hermes wants to send you {filename}",
+            accept_context=accept_ctx,
+        )
+        upload_id = card["content"]["acceptContext"]["upload_id"]
+        # Stash the bytes + routing info; Task 7's fileConsent/invoke
+        # handler reads this back when the user clicks Accept.
+        self._pending_uploads[upload_id] = {
+            "filename": filename,
+            "bytes": data,
+            "chat_id": chat_id,
+            "caption": caption,
+            "reply_to": reply_to,
+        }
+        return await self._send_attachment(
+            chat_id, card, caption=caption, reply_to=reply_to
+        )
+
+    async def _send_channel_file(
+        self,
+        chat_id: str,
+        filename: str,
+        data: bytes,
+        caption: Optional[str],
+        reply_to: Optional[str],
+    ) -> SendResult:
+        """Upload to SharePoint via Graph and post a FileDownload card."""
+        if not self._sharepoint_site_id:
+            return SendResult(
+                success=False,
+                error=(
+                    "TEAMS_SHAREPOINT_SITE_ID not configured — "
+                    "channel uploads disabled"
+                ),
+                retryable=False,
+            )
+        graph = await self._ensure_graph()
+        # Sanitize the chat_id for use as a folder name. Teams ids contain
+        # ':' and '@' which work in URLs but make for ugly SharePoint
+        # paths. The mapping is one-way; we never reverse-engineer the
+        # chat_id from the folder.
+        safe_chat_id = chat_id.replace(":", "_").replace("@", "_at_")
+        folder = f"{self._sharepoint_folder}/{safe_chat_id}"
+        url = await graph.upload_to_sharepoint(
+            site_id=self._sharepoint_site_id,
+            folder_path=folder,
+            filename=filename,
+            content=data,
+        )
+        if not url:
+            # Graph errors are logged inside the client; surface a
+            # retryable failure so the gateway can re-queue.
+            return SendResult(
+                success=False,
+                error="SharePoint upload failed",
+                retryable=True,
+            )
+        from plugins.platforms.teams.cards import build_file_download_card
+
+        # build_file_download_card takes (unique_id, file_type, url). We
+        # use the filename as the unique_id (visible label) and derive
+        # the file type from the extension.
+        ext = os.path.splitext(filename)[1].lstrip(".").lower() or "bin"
+        card = build_file_download_card(
+            unique_id=filename,
+            file_type=ext,
+            url=url,
+        )
+        return await self._send_attachment(
+            chat_id, card, caption=caption, reply_to=reply_to
+        )
+
+    async def _ensure_graph(self):
+        """Lazily build the GraphClient + GraphTokenProvider."""
+        if self._graph is None:
+            from plugins.platforms.teams.auth_graph import GraphTokenProvider
+            from plugins.platforms.teams.graph import GraphClient
+
+            self._token_provider = GraphTokenProvider(
+                client_id=self._client_id,
+                tenant_id=self._tenant_id,
+                client_secret=self._client_secret,
+            )
+            self._graph = GraphClient(self._token_provider)
+        return self._graph
+
+    async def _send_attachment(
+        self,
+        chat_id: str,
+        attachment_dict: Dict[str, Any],
+        *,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+    ) -> SendResult:
+        """Send a Bot Framework Attachment dict via the Teams SDK.
+
+        The card builders in :mod:`plugins.platforms.teams.cards` produce
+        dicts in Bot Framework wire shape. ``microsoft_teams.api.Attachment``
+        is a pydantic model whose ``content_type`` / ``content`` / ``name``
+        fields map cleanly. We wrap the dict, attach it to a fresh
+        ``MessageActivityInput``, and send via the same conv_ref / direct
+        path the existing ``send_image`` uses.
+
+        ``reply_to`` is currently ignored — matching ``send_image``'s
+        behaviour. Threading file deliveries to a parent message can be
+        added later without changing the public surface.
+        """
+        # reply_to is a parity arg for the public send_* methods; threading
+        # behaviour is a future improvement.
+        del reply_to
+
+        if not self._app:
+            return SendResult(success=False, error="Teams app not initialized")
+        try:
+            from microsoft_teams.api import Attachment, MessageActivityInput
+
+            att = Attachment(
+                content_type=attachment_dict["contentType"],
+                content=attachment_dict.get("content"),
+                name=attachment_dict.get("name"),
+            )
+            activity = MessageActivityInput().add_attachments(att)
+            if caption:
+                activity = activity.add_text(caption)
+
+            conv_ref = self._conv_refs.get(chat_id)
+            if conv_ref:
+                result = await self._app.activity_sender.send(activity, conv_ref)
+            else:
+                result = await self._app.send(chat_id, activity)
+            return SendResult(success=True, message_id=getattr(result, "id", None))
+        except Exception as e:
+            logger.error("[teams] _send_attachment failed: %s", e, exc_info=True)
+            return SendResult(success=False, error=str(e), retryable=True)
 
     async def get_chat_info(self, chat_id: str) -> dict:
         return {"name": chat_id, "type": "unknown", "chat_id": chat_id}
