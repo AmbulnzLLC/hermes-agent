@@ -1480,14 +1480,13 @@ class TeamsAdapter(BasePlatformAdapter):
             )
         from plugins.platforms.teams.cards import build_file_download_card
 
-        # build_file_download_card takes (unique_id, file_type, url). We
-        # use the filename as the unique_id (visible label) and derive
-        # the file type from the extension.
-        ext = os.path.splitext(filename)[1].lstrip(".").lower() or "bin"
+        # Channel uploads don't have a Graph drive-item id readily on hand
+        # here (upload_to_sharepoint returns the webUrl, not the item id).
+        # Pass the filename + URL; cards.py infers fileType from the
+        # extension. unique_id is omitted — the card still renders.
         card = build_file_download_card(
-            unique_id=filename,
-            file_type=ext,
-            url=url,
+            filename=filename,
+            content_url=url,
         )
         return await self._send_attachment(
             chat_id, card, caption=caption, reply_to=reply_to

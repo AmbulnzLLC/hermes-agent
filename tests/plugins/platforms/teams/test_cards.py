@@ -110,21 +110,41 @@ def test_file_info_card_uniqueId_is_fresh():
 
 def test_file_download_card_uses_download_info_content_type():
     card = build_file_download_card(
+        filename="foo.pdf",
+        content_url="https://contoso.sharepoint.com/sites/foo/Shared%20Documents/foo.pdf",
         unique_id="aaaa-bbbb",
-        file_type="pdf",
-        url="https://contoso.sharepoint.com/sites/foo/Shared%20Documents/foo.pdf",
     )
     assert card["contentType"] == FILE_DOWNLOAD_INFO_CONTENT_TYPE
     assert card["contentType"] == "application/vnd.microsoft.teams.file.download.info"
     assert card["contentUrl"].startswith("https://contoso.sharepoint.com/")
     assert card["content"]["uniqueId"] == "aaaa-bbbb"
     assert card["content"]["fileType"] == "pdf"
+    assert card["name"] == "foo.pdf"
 
 
 def test_file_download_card_passes_unique_id_through():
     card = build_file_download_card(
-        unique_id="xyz-123", file_type="docx", url="https://x/y"
+        filename="report.docx",
+        content_url="https://x/y",
+        unique_id="xyz-123",
     )
     assert card["content"]["uniqueId"] == "xyz-123"
-    # The card's `name` mirrors the unique id (per Teams docs for channel uploads)
-    assert card["name"] == "xyz-123"
+    # The card's `name` is the filename (Teams uses this as the on-screen label).
+    assert card["name"] == "report.docx"
+
+
+def test_file_download_card_infers_file_type_from_filename():
+    card = build_file_download_card(filename="diagram.PNG", content_url="https://x/y")
+    assert card["content"]["fileType"] == "png"
+    # No extension → "file" fallback.
+    card2 = build_file_download_card(filename="LICENSE", content_url="https://x/y")
+    assert card2["content"]["fileType"] == "file"
+    # Empty after dot → also "file".
+    card3 = build_file_download_card(filename="weird.", content_url="https://x/y")
+    assert card3["content"]["fileType"] == "file"
+
+
+def test_file_download_card_omits_unique_id_when_unknown():
+    card = build_file_download_card(filename="x.txt", content_url="https://x/y")
+    assert "uniqueId" not in card["content"]
+    assert card["content"]["downloadUrl"] == "https://x/y"

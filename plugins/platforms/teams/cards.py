@@ -72,23 +72,50 @@ def build_file_info_card(filename: str, file_type: str, url: str) -> Dict[str, A
     }
 
 
-def build_file_download_card(unique_id: str, file_type: str, url: str) -> Dict[str, Any]:
+def build_file_download_card(
+    filename: str,
+    content_url: str,
+    *,
+    unique_id: Optional[str] = None,
+    file_type: Optional[str] = None,
+) -> Dict[str, Any]:
     """Build a ``file.download.info`` attachment for channel / group uploads.
 
     Used after the bot has uploaded to SharePoint via Graph and has the
     drive item's webUrl. Teams clients render this as a downloadable
-    attachment in channel posts. The ``unique_id`` is typically the Graph
-    drive-item id so subsequent interactions can resolve back to the file.
+    attachment in channel posts.
+
+    ``content_url`` is the SharePoint webUrl returned by
+    :meth:`GraphClient.upload_to_sharepoint`. ``unique_id`` should be the
+    Graph drive-item id when known (so subsequent interactions can resolve
+    back to the file); when omitted, the card still renders but the bot
+    cannot use it to look the file up later. ``file_type`` is auto-inferred
+    from the filename extension when omitted (e.g. ``foo.pdf`` → ``"pdf"``).
     """
+    content: Dict[str, Any] = {"downloadUrl": content_url}
+    if unique_id:
+        content["uniqueId"] = unique_id
+    content["fileType"] = file_type or _infer_file_type(filename)
     return {
         "contentType": FILE_DOWNLOAD_INFO_CONTENT_TYPE,
-        "contentUrl": url,
-        "name": unique_id,
-        "content": {
-            "uniqueId": unique_id,
-            "fileType": file_type,
-        },
+        "contentUrl": content_url,
+        "content": content,
+        "name": filename,
     }
+
+
+def _infer_file_type(filename: str) -> str:
+    """Return the Teams-style file type token for *filename*.
+
+    Teams accepts ``"png"`` / ``"jpg"`` / ``"pdf"`` / ... strings; the mapping
+    lines up with common extension suffixes. Files without a dotted
+    extension (``LICENSE``, ``Makefile``) fall back to ``"file"`` so Teams
+    renders a generic document icon.
+    """
+    _head, sep, ext = filename.rpartition(".")
+    if not sep:
+        return "file"
+    return ext.lower() or "file"
 
 
 __all__ = [
