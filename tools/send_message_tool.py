@@ -685,11 +685,33 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             last_result = result
         return last_result
 
+    # --- Teams: outbound media via the *running* adapter (FileConsent +
+    # SharePoint/Graph fallback). Cannot use a fresh adapter — the live
+    # instance owns _pending_uploads / _conv_refs which back the
+    # outbound→inbound webhook rendezvous. See _send_teams docstring.
+    # Teams is a plugin adapter so it has no static Platform.TEAMS — use
+    # the value-based comparison (Platform._missing_ caches the pseudo-
+    # member, so identity is stable across calls). ---
+    if platform == Platform("teams") and media_files:
+        last_result = None
+        for i, chunk in enumerate(chunks):
+            is_last = (i == len(chunks) - 1)
+            result = await _send_teams(
+                chat_id,
+                chunk,
+                media_files=media_files if is_last else None,
+                thread_id=thread_id,
+            )
+            if isinstance(result, dict) and result.get("error"):
+                return result
+            last_result = result
+        return last_result
+
     # --- Non-media platforms ---
     if media_files and not message.strip():
         return {
             "error": (
-                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao and feishu; "
+                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, feishu and teams; "
                 f"target {platform.value} had only media attachments"
             )
         }
@@ -697,7 +719,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if media_files:
         warning = (
             f"MEDIA attachments were omitted for {platform.value}; "
-            "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao and feishu"
+            "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, feishu and teams"
         )
 
     last_result = None
