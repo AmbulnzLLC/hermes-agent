@@ -15,7 +15,9 @@ do not need the real SDK app, aiohttp listener, or MSAL credentials. The
 """
 from __future__ import annotations
 
+import logging
 import os
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -348,3 +350,117 @@ def test_constructor_default_folder_is_hermes(monkeypatch):
     a = TeamsAdapter(cfg)
     assert a._sharepoint_site_id == ""
     assert a._sharepoint_folder == "hermes"
+
+
+# ---------------------------------------------------------------------------
+# _pending_uploads memory bounds + send-failure cleanup (quality fixes)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pending_upload_dropped_when_send_fails(
+    adapter, doc_file, monkeypatch, caplog
+):
+    """If FileConsent send fails, the stashed bytes must be popped."""
+    monkeypatch.setattr(
+        adapter,
+        "_send_attachment",
+        AsyncMock(
+            return_value=SendResult(success=False, error="boom", retryable=True)
+        ),
+    )
+    chat_id = "a:dm-thread-id"
+    with caplog.at_level(logging.WARNING, logger="plugins.platforms.teams.adapter"):
+        result = await adapter.send_document(chat_id, str(doc_file))
+
+    assert result.success is False
+    # Crucially: no leak of bytes when the user never got a card.
+    assert len(adapter._pending_uploads) == 0
+    assert any(
+        "FileConsent send failed" in rec.getMessage()
+        for rec in caplog.records
+        if rec.levelno == logging.WARNING
+    )
+
+
+@pytest.mark.asyncio
+async def test_pending_uploads_bounded_at_max(
+    adapter, doc_file, monkeypatch, caplog
+):
+    """Beyond the cap, oldest entries are evicted FIFO with a warning."""
+    monkeypatch.setattr(adapter, "_PENDING_UPLOAD_MAX", 3)
+
+    captured_ids: list[str] = []
+
+    # Send 4 documents, capturing the upload_id registered for each.
+    with caplog.at_level(logging.WARNING, logger="plugins.platforms.teams.adapter"):
+        for i in range(4):
+            before = set(adapter._pending_uploads.keys())
+            await adapter.send_document(f"a:dm-{i}", str(doc_file))
+            after = set(adapter._pending_uploads.keys())
+            new_ids = after - before
+            # The send may both add and (on the 4th) evict; what we want
+            # is the id that *got registered* this round.
+            if new_ids:
+                captured_ids.append(next(iter(new_ids)))
+            else:
+                # Registration + immediate eviction in same call shouldn't
+                # happen at MAX=3 with one new send (cap holds 3, we add
+                # the 4th, the oldest goes), so this branch is unexpected.
+                captured_ids.append("<missing>")
+
+    # Cap holds exactly MAX entries.
+    assert len(adapter._pending_uploads) == 3
+    # The first registered upload_id is gone.
+    assert captured_ids[0] not in adapter._pending_uploads
+    # The last 3 are present.
+    for uid in captured_ids[1:]:
+        assert uid in adapter._pending_uploads
+    # The eviction emitted a warning.
+    assert any(
+        "evicted oldest" in rec.getMessage()
+        for rec in caplog.records
+        if rec.levelno == logging.WARNING
+    )
+
+
+@pytest.mark.asyncio
+async def test_pending_uploads_evict_stale_by_ttl(adapter, doc_file):
+    """Entries older than TTL are swept on the next DM send."""
+    # First send: register a normal entry.
+    await adapter.send_document("a:dm-old", str(doc_file))
+    assert len(adapter._pending_uploads) == 1
+    old_id = next(iter(adapter._pending_uploads))
+
+    # Manually backdate the entry's timestamp past the TTL (2h ago).
+    adapter._pending_uploads[old_id]["ts"] = time.monotonic() - 7200
+
+    # Second send triggers _evict_stale_pending_uploads at the top of
+    # _send_dm_file_consent, sweeping the stale entry before registering
+    # the new one.
+    await adapter.send_document("a:dm-new", str(doc_file))
+
+    assert old_id not in adapter._pending_uploads
+    # Only the fresh entry remains.
+    assert len(adapter._pending_uploads) == 1
+
+
+def test_register_pending_upload_sets_timestamp(adapter):
+    """_register_pending_upload stamps a monotonic ts on the entry."""
+    before = time.monotonic()
+    adapter._register_pending_upload(
+        "upload-xyz",
+        {
+            "filename": "f.pdf",
+            "bytes": b"x",
+            "chat_id": "a:dm",
+            "caption": None,
+            "reply_to": None,
+        },
+    )
+    after = time.monotonic()
+
+    entry = adapter._pending_uploads["upload-xyz"]
+    assert "ts" in entry
+    assert isinstance(entry["ts"], float)
+    assert before <= entry["ts"] <= after

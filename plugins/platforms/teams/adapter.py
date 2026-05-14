@@ -27,6 +27,8 @@ import html
 import json
 import logging
 import os
+import time
+from collections import OrderedDict
 from typing import Any, Dict, Optional
 from urllib.parse import quote
 
@@ -674,6 +676,14 @@ class TeamsAdapter(BasePlatformAdapter):
 
     MAX_MESSAGE_LENGTH = 28000  # Teams text message limit (~28 KB)
 
+    # Bound _pending_uploads memory: drop oldest beyond this many entries
+    # and sweep entries older than the TTL on every DM send. Without
+    # this, a long-running gateway holding many users' un-consented DM
+    # file sends grows unboundedly in RAM (especially when users send
+    # videos but never click Allow / Decline).
+    _PENDING_UPLOAD_MAX = 64
+    _PENDING_UPLOAD_TTL_SECONDS = 3600  # 1 hour
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("teams"))
         extra = config.extra or {}
@@ -703,7 +713,9 @@ class TeamsAdapter(BasePlatformAdapter):
         # Files awaiting FileConsent acceptance from a DM user — Task 7's
         # invoke handler drains this dict; Task 6 only fills it. Keyed by
         # the upload_id seeded into the FileConsent acceptContext.
-        self._pending_uploads: Dict[str, Dict[str, Any]] = {}
+        # OrderedDict + size cap + TTL bound memory; see
+        # _register_pending_upload / _evict_stale_pending_uploads.
+        self._pending_uploads: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         # Lazy Graph client + token provider; built on first channel send
         # so DM-only deployments don't pay the msgraph-sdk import cost.
         self._graph: Any = None
@@ -1417,6 +1429,11 @@ class TeamsAdapter(BasePlatformAdapter):
         """Send a FileConsentCard and remember the bytes for the invoke handler."""
         from plugins.platforms.teams.cards import build_file_consent_card
 
+        # Sweep TTL-expired entries on every DM send so a long-running
+        # gateway with users who never click Allow / Decline doesn't grow
+        # unboundedly.
+        self._evict_stale_pending_uploads()
+
         size = len(data)
         accept_ctx = {"filename": filename, "service_url_chat_id": chat_id}
         card = build_file_consent_card(
@@ -1428,16 +1445,68 @@ class TeamsAdapter(BasePlatformAdapter):
         upload_id = card["content"]["acceptContext"]["upload_id"]
         # Stash the bytes + routing info; Task 7's fileConsent/invoke
         # handler reads this back when the user clicks Accept.
-        self._pending_uploads[upload_id] = {
-            "filename": filename,
-            "bytes": data,
-            "chat_id": chat_id,
-            "caption": caption,
-            "reply_to": reply_to,
-        }
-        return await self._send_attachment(
+        self._register_pending_upload(
+            upload_id,
+            {
+                "filename": filename,
+                "bytes": data,
+                "chat_id": chat_id,
+                "caption": caption,
+                "reply_to": reply_to,
+            },
+        )
+        result = await self._send_attachment(
             chat_id, card, caption=caption, reply_to=reply_to
         )
+        if not result.success:
+            # Send failed — drop the stashed bytes so we don't leak
+            # ~one-file-of-RAM per failed FileConsent send. The user
+            # never got a card to click, so the entry is dead weight.
+            self._pending_uploads.pop(upload_id, None)
+            logger.warning(
+                "[teams] FileConsent send failed for upload_id=%s — "
+                "bytes dropped, user got no card",
+                upload_id,
+            )
+        return result
+
+    def _register_pending_upload(
+        self, upload_id: str, entry: Dict[str, Any]
+    ) -> None:
+        """Insert a pending-upload entry, stamping it and enforcing the size cap.
+
+        Entries are stored with a monotonic timestamp so
+        ``_evict_stale_pending_uploads`` can sweep stale ones. When the cap
+        is reached we drop the oldest (FIFO via OrderedDict insertion order)
+        and emit a warning so saturation is visible in logs.
+        """
+        self._evict_stale_pending_uploads()
+        entry["ts"] = time.monotonic()
+        self._pending_uploads[upload_id] = entry
+        while len(self._pending_uploads) > self._PENDING_UPLOAD_MAX:
+            evicted_id, _evicted = self._pending_uploads.popitem(last=False)
+            logger.warning(
+                "[teams] _pending_uploads at cap (%d) — evicted oldest upload_id=%s",
+                self._PENDING_UPLOAD_MAX,
+                evicted_id,
+            )
+
+    def _evict_stale_pending_uploads(self) -> None:
+        """Drop pending-upload entries older than the TTL."""
+        now = time.monotonic()
+        ttl = self._PENDING_UPLOAD_TTL_SECONDS
+        stale = [
+            uid
+            for uid, entry in self._pending_uploads.items()
+            if now - entry.get("ts", now) > ttl
+        ]
+        for uid in stale:
+            self._pending_uploads.pop(uid, None)
+            logger.info(
+                "[teams] _pending_uploads evicted stale entry upload_id=%s (TTL %ds)",
+                uid,
+                ttl,
+            )
 
     async def _send_channel_file(
         self,
@@ -1494,6 +1563,11 @@ class TeamsAdapter(BasePlatformAdapter):
 
     async def _ensure_graph(self):
         """Lazily build the GraphClient + GraphTokenProvider."""
+        # Lazy single-init: there's no await between the check and the
+        # assignments, so asyncio's cooperative scheduler guarantees this
+        # block is atomic. Even on the (impossible) double-init path,
+        # GraphTokenProvider's per-scope locks make duplicate construction
+        # harmless.
         if self._graph is None:
             from plugins.platforms.teams.auth_graph import GraphTokenProvider
             from plugins.platforms.teams.graph import GraphClient
