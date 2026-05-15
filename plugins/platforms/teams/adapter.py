@@ -687,6 +687,29 @@ _HOSTED_CONTENT_RE = re.compile(
 )
 
 
+# Bot Framework hosts that require an Authorization: Bearer header on GETs.
+# When an inbound activity references a content_url under one of these hosts
+# (typical shape: https://smba.trafficmanager.net/<region>/<tenant>/v3/
+# attachments/<id>/views/original) the shared cache_*_from_url helpers will
+# 401 because they don't carry per-platform auth. We fetch the bytes here
+# instead, using the SDK-managed bot token, then route to cache_*_from_bytes.
+_BF_ATTACHMENT_HOSTS = {"smba.trafficmanager.net"}
+
+
+def _is_bf_attachment_url(url: Optional[str]) -> bool:
+    """True if ``url`` points at a Bot Framework attachment endpoint that
+    needs a Bearer token."""
+    if not url or not isinstance(url, str):
+        return False
+    try:
+        from urllib.parse import urlparse
+
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return False
+    return host in _BF_ATTACHMENT_HOSTS
+
+
 def _parse_hosted_content_id(url: str) -> Optional[str]:
     """Extract the hostedContents/{id} fragment from a Teams URL.
 
@@ -856,6 +879,53 @@ class TeamsAdapter(BasePlatformAdapter):
         self._mark_disconnected()
         logger.info("[teams] Disconnected")
 
+    async def _fetch_bf_attachment_bytes(self, url: str) -> Optional[bytes]:
+        """GET a Bot Framework attachment URL with an SDK-minted bearer token.
+
+        BF attachment endpoints (``smba.trafficmanager.net/.../v3/attachments/
+        .../views/original``) reject anonymous GETs with 401. The SDK already
+        manages an MSAL-cached bot token via ``self._app._get_bot_token``;
+        we stringify that token (``JsonWebToken.__str__`` returns the raw JWT)
+        and attach it as ``Authorization: Bearer <jwt>``.
+
+        Returns the response body on 2xx, or ``None`` on any failure (no
+        token, non-200, network error). Logs at WARNING for diagnosable
+        failures so the same ``[teams][attach]`` log breadcrumbs the rest
+        of the attachment loop emits remain greppable.
+        """
+        if not url:
+            return None
+        if self._app is None:
+            logger.warning("[teams][attach] BF fetch skipped — no SDK app available")
+            return None
+        try:
+            token = await self._app._get_bot_token()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[teams][attach] BF token fetch failed: %s", exc)
+            return None
+        if token is None:
+            logger.warning("[teams][attach] BF token fetch returned None")
+            return None
+        bearer = str(token)
+        headers = {"Authorization": f"Bearer {bearer}"}
+
+        try:
+            import aiohttp as _aiohttp
+
+            timeout = _aiohttp.ClientTimeout(total=60)
+            async with _aiohttp.ClientSession(timeout=timeout) as sess:
+                async with sess.get(url, headers=headers) as resp:
+                    if resp.status != 200:
+                        logger.warning(
+                            "[teams][attach] BF GET %s -> status=%s",
+                            url, resp.status,
+                        )
+                        return None
+                    return await resp.read()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[teams][attach] BF GET %s raised: %s", url, exc)
+            return None
+
     async def _on_message(self, ctx: ActivityContext[MessageActivity]) -> None:
         """Process an incoming Teams message and dispatch to the gateway."""
         activity = ctx.activity
@@ -961,6 +1031,38 @@ class TeamsAdapter(BasePlatformAdapter):
             try:
                 # ── Shape 1: classic content_url with image/audio/video MIME ─
                 if content_url and content_type.startswith("image/"):
+                    if _is_bf_attachment_url(content_url):
+                        logger.info("[teams][attach][%d] dispatch=image_bf_url", idx)
+                        data = await self._fetch_bf_attachment_bytes(content_url)
+                        cached = None
+                        if data is not None:
+                            from gateway.platforms.base import cache_image_from_bytes
+                            sub = content_type.split("/", 1)[1].split(";")[0].strip() or "jpg"
+                            ext = "." + ("jpg" if sub == "jpeg" else sub)
+                            try:
+                                cached = cache_image_from_bytes(data, ext=ext)
+                            except Exception as exc:  # noqa: BLE001
+                                logger.exception(
+                                    "[teams][attach][%d] cache_image_from_bytes failed: %s",
+                                    idx, exc,
+                                )
+                                cached = None
+                            logger.info("[teams][attach][%d] cache_image_from_bytes -> %r", idx, cached)
+                        if cached is None:
+                            cached = await self._try_graph_hosted_fallback(
+                                idx=idx,
+                                url=content_url,
+                                team_id=graph_team_id,
+                                channel_id=graph_channel_id,
+                                activity_id=graph_activity_id,
+                                kind="image",
+                                ext=".jpg",
+                                filename=att_name,
+                            )
+                        if cached:
+                            media_urls.append(cached)
+                            media_types.append(content_type)
+                        continue
                     logger.info("[teams][attach][%d] dispatch=image_url", idx)
                     cached = await cache_image_from_url(content_url)
                     logger.info("[teams][attach][%d] cache_image_from_url -> %r", idx, cached)
@@ -981,6 +1083,26 @@ class TeamsAdapter(BasePlatformAdapter):
                     continue
                 if content_url and content_type.startswith("audio/"):
                     ext = "." + (content_type.split("/", 1)[1].split(";")[0].strip() or "ogg")
+                    if _is_bf_attachment_url(content_url):
+                        logger.info("[teams][attach][%d] dispatch=audio_bf_url ext=%s", idx, ext)
+                        data = await self._fetch_bf_attachment_bytes(content_url)
+                        cached = None
+                        if data is not None:
+                            from gateway.platforms.base import cache_audio_from_bytes
+                            try:
+                                cached = cache_audio_from_bytes(data, ext=ext)
+                            except Exception as exc:  # noqa: BLE001
+                                logger.exception(
+                                    "[teams][attach][%d] cache_audio_from_bytes failed: %s",
+                                    idx, exc,
+                                )
+                                cached = None
+                            logger.info("[teams][attach][%d] cache_audio_from_bytes -> %r", idx, cached)
+                        if cached:
+                            media_urls.append(cached)
+                            media_types.append(content_type)
+                            msg_type_override = msg_type_override or MessageType.VOICE
+                        continue
                     logger.info("[teams][attach][%d] dispatch=audio_url ext=%s", idx, ext)
                     cached = await cache_audio_from_url(content_url, ext=ext)
                     logger.info("[teams][attach][%d] cache_audio_from_url -> %r", idx, cached)
@@ -991,6 +1113,26 @@ class TeamsAdapter(BasePlatformAdapter):
                     continue
                 if content_url and content_type.startswith("video/"):
                     ext = "." + (content_type.split("/", 1)[1].split(";")[0].strip() or "mp4")
+                    if _is_bf_attachment_url(content_url):
+                        logger.info("[teams][attach][%d] dispatch=video_bf_url ext=%s", idx, ext)
+                        data = await self._fetch_bf_attachment_bytes(content_url)
+                        cached = None
+                        if data is not None:
+                            from gateway.platforms.base import cache_video_from_bytes
+                            try:
+                                cached = cache_video_from_bytes(data, ext=ext)
+                            except Exception as exc:  # noqa: BLE001
+                                logger.exception(
+                                    "[teams][attach][%d] cache_video_from_bytes failed: %s",
+                                    idx, exc,
+                                )
+                                cached = None
+                            logger.info("[teams][attach][%d] cache_video_from_bytes -> %r", idx, cached)
+                        if cached:
+                            media_urls.append(cached)
+                            media_types.append(content_type)
+                            msg_type_override = msg_type_override or MessageType.VIDEO
+                        continue
                     logger.info("[teams][attach][%d] dispatch=video_url ext=%s", idx, ext)
                     cached = await cache_video_from_url(content_url, ext=ext)
                     logger.info("[teams][attach][%d] cache_video_from_url -> %r", idx, cached)
