@@ -302,6 +302,47 @@ async def test_send_attachment_uses_conv_ref_when_available(adapter, doc_file):
     adapter._app.send.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_send_attachment_forwards_content_url_to_sdk_attachment(adapter):
+    """``_send_attachment`` must forward ``contentUrl`` to the SDK Attachment.
+
+    FileInfoCard / FileDownloadInfoCard responses to a FileConsent invoke have
+    ``contentUrl`` at the *top level* of the Bot Framework attachment dict. The
+    SDK ``Attachment`` model exposes ``content_url`` as a real field — dropping
+    it makes Bot Framework reject the activity with HTTP 400 and the consent
+    card buttons unfreeze with no visible result. Pin the four-field wrap.
+    """
+    chat_id = "a:dm-content-url"
+    attachment_dict = {
+        "contentType": "application/vnd.microsoft.teams.file.download.info",
+        "contentUrl": "https://example.sharepoint.com/sites/x/file.pdf",
+        "name": "Canvas Clinical Call.pdf",
+        "content": {"uniqueId": "abc-123", "fileType": "pdf"},
+    }
+
+    captured: dict = {}
+
+    async def fake_send(_chat_id, activity):
+        # MessageActivityInput.add_attachments stashes the SDK Attachment on
+        # the activity — grab the first one so the assertion can inspect it.
+        captured["attachment"] = activity.attachments[0]
+        return Mock(id="mid-1")
+
+    adapter._app.send = AsyncMock(side_effect=fake_send)
+
+    result = await adapter._send_attachment(chat_id, attachment_dict)
+
+    assert result.success is True
+    att = captured["attachment"]
+    assert att.content_type == attachment_dict["contentType"]
+    assert att.content_url == attachment_dict["contentUrl"], (
+        "Attachment.content_url must be forwarded from attachment_dict['contentUrl']; "
+        "Bot Framework returns 400 for FileInfoCard responses without it."
+    )
+    assert att.name == attachment_dict["name"]
+    assert att.content == attachment_dict["content"]
+
+
 # ---------------------------------------------------------------------------
 # Constructor — extra config & env plumbing
 # ---------------------------------------------------------------------------

@@ -1935,6 +1935,7 @@ class TeamsAdapter(BasePlatformAdapter):
 
             att = Attachment(
                 content_type=attachment_dict["contentType"],
+                content_url=attachment_dict.get("contentUrl"),
                 content=attachment_dict.get("content"),
                 name=attachment_dict.get("name"),
             )
