@@ -1996,6 +1996,14 @@ class BasePlatformAdapter(ABC):
         - <img src="https://example.com/image.png">
         - <img src="https://example.com/image.png"></img>
         
+        Both the markdown and HTML branches require the URL to either end in a
+        known image extension (.png/.jpg/.jpeg/.gif/.webp) or contain a known
+        image-CDN host fragment. Without that guard, the bot can boomerang any
+        ``<img>`` tag it merely *quotes* in prose (e.g. an inbound Teams AMS
+        URL or a teaching-example placeholder like ``<img src="https://...">``)
+        as a real outbound attachment, which the destination platform can't
+        authenticate and renders as a broken-image icon.
+        
         Args:
             content: The response text to scan.
         
@@ -2005,21 +2013,38 @@ class BasePlatformAdapter(ABC):
         images = []
         cleaned = content
         
+        def _looks_like_image_url(url: str) -> bool:
+            """Allowlist check shared by markdown and HTML branches.
+
+            A URL is treated as an image only if it has a recognized image
+            extension in its path (matched before any query string) or its
+            host/path contains a known image-CDN fragment.
+            """
+            lower = url.lower().split("?", 1)[0].split("#", 1)[0]
+            image_exts = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+            if lower.endswith(image_exts):
+                return True
+            cdn_fragments = ("fal.media", "fal-cdn", "replicate.delivery")
+            url_lower = url.lower()
+            return any(fragment in url_lower for fragment in cdn_fragments)
+        
         # Match markdown images: ![alt](url)
         md_pattern = r'!\[([^\]]*)\]\((https?://[^\s\)]+)\)'
         for match in re.finditer(md_pattern, content):
             alt_text = match.group(1)
             url = match.group(2)
             # Only extract URLs that look like actual images
-            if any(url.lower().endswith(ext) or ext in url.lower() for ext in
-                   ['.png', '.jpg', '.jpeg', '.gif', '.webp', 'fal.media', 'fal-cdn', 'replicate.delivery']):
+            if _looks_like_image_url(url):
                 images.append((url, alt_text))
         
         # Match HTML img tags: <img src="url"> or <img src="url"></img> or <img src="url"/>
         html_pattern = r'<img\s+src=["\']?(https?://[^\s"\'<>]+)["\']?\s*/?>\s*(?:</img>)?'
         for match in re.finditer(html_pattern, content):
             url = match.group(1)
-            images.append((url, ""))
+            # Apply the same allowlist as the markdown branch so we don't peel
+            # quoted/example <img> tags and ship them as broken attachments.
+            if _looks_like_image_url(url):
+                images.append((url, ""))
         
         # Remove only the matched image tags from content (not all markdown images)
         if images:
