@@ -1358,6 +1358,36 @@ class TeamsAdapter(BasePlatformAdapter):
                     continue
 
                 # ── Fell through every branch ────────────────────────────────
+                # DIAGNOSTIC (Test #7 scaffolding): dump the full content payload
+                # for text/html and other dropped attachments so we can see whether
+                # Teams is shipping inline <img src=".../hostedContents/.../$value">
+                # references in there. Truncate to 8KB to keep logs sane; redact
+                # obvious bearer tokens.
+                if content_type == "text/html":
+                    raw_content = getattr(att, "content", None)
+                    if isinstance(raw_content, str):
+                        html_text = raw_content
+                    elif isinstance(raw_content, dict):
+                        html_text = raw_content.get("text") or raw_content.get("html") or repr(raw_content)
+                    else:
+                        html_text = repr(raw_content)
+                    snippet = html_text[:8192]
+                    truncated = "...[truncated]" if len(html_text) > 8192 else ""
+                    # Pull out any hostedContents URLs explicitly so they're greppable
+                    import re as _re
+                    hc_urls = _re.findall(
+                        r"https?://[^\"'\s>]*?hostedContents/[^\"'\s>]+",
+                        html_text,
+                    )
+                    logger.info(
+                        "[teams][attach][%d] DIAG html payload (%d chars, %d hostedContents refs): %s%s",
+                        idx, len(html_text), len(hc_urls), snippet, truncated,
+                    )
+                    for hc_idx, hc_url in enumerate(hc_urls):
+                        logger.info(
+                            "[teams][attach][%d] DIAG hostedContents[%d]: %s",
+                            idx, hc_idx, hc_url,
+                        )
                 logger.info(
                     "[teams][attach][%d] DROP unhandled (content_type=%r, has_url=%s)",
                     idx, content_type, bool(content_url),
