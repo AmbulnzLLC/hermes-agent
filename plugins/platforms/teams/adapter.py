@@ -1358,11 +1358,13 @@ class TeamsAdapter(BasePlatformAdapter):
                     continue
 
                 # ── Fell through every branch ────────────────────────────────
-                # DIAGNOSTIC (Test #7 scaffolding): dump the full content payload
-                # for text/html and other dropped attachments so we can see whether
-                # Teams is shipping inline <img src=".../hostedContents/.../$value">
-                # references in there. Truncate to 8KB to keep logs sane; redact
-                # obvious bearer tokens.
+                # FORENSICS: dump the full content payload for text/html and
+                # other dropped attachments so we can see whether Teams is
+                # shipping inline <img src=".../hostedContents/.../$value">
+                # references in there. DEBUG-level so it's off in production
+                # but available when troubleshooting the channel-message inline
+                # image flow (PR #2's Graph hostedContents fallback path).
+                # Truncate to 8KB to keep logs sane.
                 if content_type == "text/html":
                     raw_content = getattr(att, "content", None)
                     if isinstance(raw_content, str):
@@ -1379,13 +1381,13 @@ class TeamsAdapter(BasePlatformAdapter):
                         r"https?://[^\"'\s>]*?hostedContents/[^\"'\s>]+",
                         html_text,
                     )
-                    logger.info(
-                        "[teams][attach][%d] DIAG html payload (%d chars, %d hostedContents refs): %s%s",
+                    logger.debug(
+                        "[teams][attach][%d] dropped html payload (%d chars, %d hostedContents refs): %s%s",
                         idx, len(html_text), len(hc_urls), snippet, truncated,
                     )
                     for hc_idx, hc_url in enumerate(hc_urls):
-                        logger.info(
-                            "[teams][attach][%d] DIAG hostedContents[%d]: %s",
+                        logger.debug(
+                            "[teams][attach][%d] dropped hostedContents[%d]: %s",
                             idx, hc_idx, hc_url,
                         )
                 logger.info(
