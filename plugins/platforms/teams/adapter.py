@@ -868,7 +868,7 @@ class TeamsAdapter(BasePlatformAdapter):
         # Used to send cards with the correct conversation type (personal/group/channel).
         self._conv_refs: Dict[str, Any] = {}
 
-        # SharePoint target for outbound channel/group file uploads (Task 6).
+        # SharePoint target for outbound channel/group file uploads.
         # Defaults: site_id="" disables channel uploads; folder defaults to
         # "hermes" so DM-only deployments without SharePoint config still
         # construct cleanly (channel sends will return a clean error).
@@ -880,9 +880,10 @@ class TeamsAdapter(BasePlatformAdapter):
             extra.get("sharepoint_folder")
             or os.getenv("TEAMS_SHAREPOINT_FOLDER", "hermes")
         )
-        # Files awaiting FileConsent acceptance from a DM user — Task 7's
-        # invoke handler drains this dict; Task 6 only fills it. Keyed by
-        # the upload_id seeded into the FileConsent acceptContext.
+        # Files awaiting FileConsent acceptance from a DM user — the
+        # fileConsent/invoke handler drains this dict; the DM send path
+        # primes it. Keyed by the upload_id seeded into the FileConsent
+        # acceptContext.
         # OrderedDict + size cap + TTL bound memory; see
         # _register_pending_upload / _evict_stale_pending_uploads.
         self._pending_uploads: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
@@ -1693,13 +1694,13 @@ class TeamsAdapter(BasePlatformAdapter):
         )
 
     # ------------------------------------------------------------------
-    # Outbound files (Task 6) — documents, video, voice
+    # Outbound files — documents, video, voice
     #
     # Teams' wire protocol for file delivery is split:
     #   • DMs: the bot sends a FileConsentCard, the user clicks accept,
     #     Teams fires a fileConsent/invoke with a OneDrive upload URL,
-    #     the bot PUTs the bytes there. The accept/invoke handler is
-    #     wired up in Task 7; Task 6 just primes _pending_uploads.
+    #     the bot PUTs the bytes there. The DM send path primes
+    #     _pending_uploads; the fileConsent/invoke handler drains it.
     #   • Channels / group chats: the bot uploads to a SharePoint
     #     document library via Microsoft Graph, then sends a
     #     file.download.info attachment pointing at the resulting
@@ -1968,8 +1969,8 @@ class TeamsAdapter(BasePlatformAdapter):
             accept_context=accept_ctx,
         )
         upload_id = card["content"]["acceptContext"]["upload_id"]
-        # Stash the bytes + routing info; Task 7's fileConsent/invoke
-        # handler reads this back when the user clicks Accept.
+        # Stash the bytes + routing info; the fileConsent/invoke handler
+        # reads this back when the user clicks Accept.
         self._register_pending_upload(
             upload_id,
             {
