@@ -710,6 +710,118 @@ def _is_bf_attachment_url(url: Optional[str]) -> bool:
     return host in _BF_ATTACHMENT_HOSTS
 
 
+# Magic-byte prefixes used when a Teams attachment arrives with a wildcard
+# or missing MIME subtype (e.g. ``image/*`` from inline-pasted images). The
+# subtype must never be passed straight through into a cache filename or it
+# leaks as a literal ``.*`` extension and breaks downstream tooling that
+# resolves files by extension.
+_IMAGE_DEFAULT_EXT = ".jpg"
+_AUDIO_DEFAULT_EXT = ".ogg"
+_VIDEO_DEFAULT_EXT = ".mp4"
+
+
+def _sniff_image_ext(data: bytes) -> Optional[str]:
+    if not data:
+        return None
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if data.startswith(b"GIF87a") or data.startswith(b"GIF89a"):
+        return ".gif"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    if data.startswith(b"BM"):
+        return ".bmp"
+    return None
+
+
+def _sniff_audio_ext(data: bytes) -> Optional[str]:
+    if not data:
+        return None
+    if data.startswith(b"OggS"):
+        return ".ogg"
+    if data.startswith(b"ID3") or data.startswith(b"\xff\xfb") or data.startswith(b"\xff\xf3") or data.startswith(b"\xff\xf2"):
+        return ".mp3"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+        return ".wav"
+    if data.startswith(b"fLaC"):
+        return ".flac"
+    # ISO BMFF (m4a/aac in mp4 container) — ftyp box at offset 4
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        brand = data[8:12]
+        if brand in (b"M4A ", b"M4B ", b"mp42", b"isom"):
+            return ".m4a"
+    return None
+
+
+def _sniff_video_ext(data: bytes) -> Optional[str]:
+    if not data:
+        return None
+    # ISO BMFF — common brands for mp4/mov
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        brand = data[8:12]
+        if brand.startswith(b"qt"):
+            return ".mov"
+        # isom / mp42 / iso2 / dash / etc. all map to .mp4 for our purposes
+        return ".mp4"
+    # WebM / Matroska EBML header
+    if data.startswith(b"\x1aE\xdf\xa3"):
+        return ".webm"
+    # AVI
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"AVI ":
+        return ".avi"
+    return None
+
+
+def _resolve_media_ext(subtype: str, data: bytes, kind: str) -> str:
+    """Resolve a safe file extension for a Teams media attachment.
+
+    Teams sometimes posts attachments with ``content_type="image/*"`` (literal
+    asterisk wildcard) — particularly inline-pasted images. Splitting that on
+    ``"/"`` would yield ``"*"`` and produce a cache filename with a literal
+    ``.*`` extension, breaking every downstream consumer that opens files by
+    extension. Instead, when the subtype is missing, ``"*"``, or otherwise
+    meaningless, sniff the bytes via magic numbers and fall back to a sane
+    per-kind default.
+
+    Args:
+        subtype: The MIME subtype (already lowercased; e.g. ``"png"``,
+            ``"jpeg"``, ``"*"``, or ``""``).
+        data: The fetched bytes (may be empty if the fetch failed).
+        kind: ``"image"``, ``"audio"``, or ``"video"``.
+
+    Returns:
+        Extension including the leading dot, e.g. ``".png"``. Never returns
+        ``".*"`` or an empty string.
+    """
+    sub = (subtype or "").strip().lower()
+    # Strip any codec params left in the subtype (defence against caller bugs)
+    sub = sub.split(";", 1)[0].strip()
+
+    # jpeg → jpg normalisation, regardless of source
+    if sub == "jpeg":
+        return ".jpg"
+
+    # Explicit, non-wildcard subtype: trust it. Codec/container variants are
+    # too broad to whitelist and the caller already validated the kind via
+    # the ``image/`` / ``audio/`` / ``video/`` prefix.
+    if sub and sub != "*":
+        return "." + sub
+
+    # Wildcard or empty — sniff bytes.
+    if kind == "image":
+        sniffed = _sniff_image_ext(data)
+        return sniffed or _IMAGE_DEFAULT_EXT
+    if kind == "audio":
+        sniffed = _sniff_audio_ext(data)
+        return sniffed or _AUDIO_DEFAULT_EXT
+    if kind == "video":
+        sniffed = _sniff_video_ext(data)
+        return sniffed or _VIDEO_DEFAULT_EXT
+    return _IMAGE_DEFAULT_EXT
+
+
 def _parse_hosted_content_id(url: str) -> Optional[str]:
     """Extract the hostedContents/{id} fragment from a Teams URL.
 
@@ -1037,8 +1149,8 @@ class TeamsAdapter(BasePlatformAdapter):
                         cached = None
                         if data is not None:
                             from gateway.platforms.base import cache_image_from_bytes
-                            sub = content_type.split("/", 1)[1].split(";")[0].strip() or "jpg"
-                            ext = "." + ("jpg" if sub == "jpeg" else sub)
+                            sub = content_type.split("/", 1)[1].split(";")[0].strip()
+                            ext = _resolve_media_ext(sub, data, "image")
                             try:
                                 cached = cache_image_from_bytes(data, ext=ext)
                             except Exception as exc:  # noqa: BLE001
@@ -1082,13 +1194,14 @@ class TeamsAdapter(BasePlatformAdapter):
                         media_types.append(content_type)
                     continue
                 if content_url and content_type.startswith("audio/"):
-                    ext = "." + (content_type.split("/", 1)[1].split(";")[0].strip() or "ogg")
+                    sub = content_type.split("/", 1)[1].split(";")[0].strip()
                     if _is_bf_attachment_url(content_url):
-                        logger.info("[teams][attach][%d] dispatch=audio_bf_url ext=%s", idx, ext)
+                        logger.info("[teams][attach][%d] dispatch=audio_bf_url subtype=%s", idx, sub or "*")
                         data = await self._fetch_bf_attachment_bytes(content_url)
                         cached = None
                         if data is not None:
                             from gateway.platforms.base import cache_audio_from_bytes
+                            ext = _resolve_media_ext(sub, data, "audio")
                             try:
                                 cached = cache_audio_from_bytes(data, ext=ext)
                             except Exception as exc:  # noqa: BLE001
@@ -1097,12 +1210,13 @@ class TeamsAdapter(BasePlatformAdapter):
                                     idx, exc,
                                 )
                                 cached = None
-                            logger.info("[teams][attach][%d] cache_audio_from_bytes -> %r", idx, cached)
+                            logger.info("[teams][attach][%d] cache_audio_from_bytes -> %r (ext=%s)", idx, cached, ext)
                         if cached:
                             media_urls.append(cached)
                             media_types.append(content_type)
                             msg_type_override = msg_type_override or MessageType.VOICE
                         continue
+                    ext = _resolve_media_ext(sub, b"", "audio")
                     logger.info("[teams][attach][%d] dispatch=audio_url ext=%s", idx, ext)
                     cached = await cache_audio_from_url(content_url, ext=ext)
                     logger.info("[teams][attach][%d] cache_audio_from_url -> %r", idx, cached)
@@ -1112,13 +1226,14 @@ class TeamsAdapter(BasePlatformAdapter):
                         msg_type_override = msg_type_override or MessageType.VOICE
                     continue
                 if content_url and content_type.startswith("video/"):
-                    ext = "." + (content_type.split("/", 1)[1].split(";")[0].strip() or "mp4")
+                    sub = content_type.split("/", 1)[1].split(";")[0].strip()
                     if _is_bf_attachment_url(content_url):
-                        logger.info("[teams][attach][%d] dispatch=video_bf_url ext=%s", idx, ext)
+                        logger.info("[teams][attach][%d] dispatch=video_bf_url subtype=%s", idx, sub or "*")
                         data = await self._fetch_bf_attachment_bytes(content_url)
                         cached = None
                         if data is not None:
                             from gateway.platforms.base import cache_video_from_bytes
+                            ext = _resolve_media_ext(sub, data, "video")
                             try:
                                 cached = cache_video_from_bytes(data, ext=ext)
                             except Exception as exc:  # noqa: BLE001
@@ -1127,12 +1242,13 @@ class TeamsAdapter(BasePlatformAdapter):
                                     idx, exc,
                                 )
                                 cached = None
-                            logger.info("[teams][attach][%d] cache_video_from_bytes -> %r", idx, cached)
+                            logger.info("[teams][attach][%d] cache_video_from_bytes -> %r (ext=%s)", idx, cached, ext)
                         if cached:
                             media_urls.append(cached)
                             media_types.append(content_type)
                             msg_type_override = msg_type_override or MessageType.VIDEO
                         continue
+                    ext = _resolve_media_ext(sub, b"", "video")
                     logger.info("[teams][attach][%d] dispatch=video_url ext=%s", idx, ext)
                     cached = await cache_video_from_url(content_url, ext=ext)
                     logger.info("[teams][attach][%d] cache_video_from_url -> %r", idx, cached)
