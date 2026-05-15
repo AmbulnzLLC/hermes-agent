@@ -537,10 +537,32 @@ def _make_consent_activity(
     return FileConsentInvokeActivity.model_construct(value=response)
 
 
-def _make_ctx(activity):
-    """Wrap an activity in the minimal ``ctx`` shape the handler reads."""
+def _make_ctx(activity, *, conversation_id: str = "dm:user1"):
+    """Wrap an activity in the minimal ``ctx`` shape the handler reads.
+
+    Also attaches a ``conversation`` with ``id`` to the activity (so the
+    handler can read ``ctx.activity.conversation.id`` for consent-card
+    cleanup) and an ``api.conversations.activities(conv_id).delete(...)``
+    chain whose ``delete`` is an ``AsyncMock`` tests can inspect.
+    """
     ctx = MagicMock()
     ctx.activity = activity
+    # Attach conversation.id without blocking pydantic model_construct shape.
+    if not hasattr(activity, "conversation") or activity.conversation is None:
+        try:
+            activity.conversation = MagicMock(id=conversation_id)
+        except (AttributeError, TypeError):
+            # Pydantic model with frozen fields — skip; tests targeting
+            # delete will use _make_ctx_with_api below instead.
+            pass
+    # api.conversations.activities(conv_id) returns an object with async delete.
+    delete_mock = AsyncMock()
+    activity_ops = MagicMock()
+    activity_ops.delete = delete_mock
+    ctx.api = MagicMock()
+    ctx.api.conversations.activities = MagicMock(return_value=activity_ops)
+    # Stash the delete mock on ctx for direct test inspection.
+    ctx._delete_mock = delete_mock
     return ctx
 
 
@@ -589,7 +611,7 @@ def mock_aiohttp_put(monkeypatch):
     return recorder
 
 
-def _register(adapter, upload_id: str, *, filename="r.pdf", data=b"PDFCONTENT", chat_id="dm:user1"):
+def _register(adapter, upload_id: str, *, filename="r.pdf", data=b"PDFCONTENT", chat_id="dm:user1", activity_id="consent-msg-id"):
     adapter._register_pending_upload(
         upload_id,
         {
@@ -598,6 +620,7 @@ def _register(adapter, upload_id: str, *, filename="r.pdf", data=b"PDFCONTENT", 
             "chat_id": chat_id,
             "caption": None,
             "reply_to": None,
+            "activity_id": activity_id,
         },
     )
 
@@ -975,3 +998,83 @@ async def test_disconnect_clears_loop(adapter):
 
     await adapter.disconnect()
     assert adapter._loop is None
+
+
+# ---------------------------------------------------------------------------
+# Consent card cleanup — both Accept and Decline must delete the card so
+# Teams' UI doesn't leave the buttons re-enabling indefinitely.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_file_consent_decline_deletes_consent_card(
+    adapter, mock_aiohttp_put
+):
+    """Decline path must delete the original FileConsentCard activity."""
+    _register(adapter, "u1", chat_id="dm:user1", activity_id="consent-act-1")
+    activity = _make_consent_activity(
+        action="decline", context={"upload_id": "u1"}
+    )
+    ctx = _make_ctx(activity, conversation_id="dm:user1")
+
+    await adapter._handle_file_consent_invoke(ctx)
+
+    # The handler should have called ctx.api.conversations.activities("dm:user1").delete("consent-act-1")
+    ctx.api.conversations.activities.assert_called_once_with("dm:user1")
+    ctx._delete_mock.assert_awaited_once_with("consent-act-1")
+
+
+@pytest.mark.asyncio
+async def test_file_consent_accept_deletes_consent_card(
+    adapter, mock_aiohttp_put
+):
+    """Accept path must also delete the original card after PUT succeeds."""
+    from microsoft_teams.api.models import FileUploadInfo
+
+    _register(adapter, "u1", chat_id="dm:user1", activity_id="consent-act-2")
+    upload_info = FileUploadInfo.model_construct(
+        upload_url="https://onedrive.example/upload",
+        content_url="https://example/content",
+        unique_id="uid",
+        file_type="pdf",
+        name="r.pdf",
+    )
+    activity = _make_consent_activity(
+        action="accept",
+        context={"upload_id": "u1"},
+        upload_info=upload_info,
+    )
+    ctx = _make_ctx(activity, conversation_id="dm:user1")
+    mock_aiohttp_put["status"] = 201
+
+    # Stub _post_file_info_card so we don't go down the FileInfo path.
+    adapter._post_file_info_card = AsyncMock(return_value=None)
+
+    await adapter._handle_file_consent_invoke(ctx)
+
+    ctx.api.conversations.activities.assert_called_once_with("dm:user1")
+    ctx._delete_mock.assert_awaited_once_with("consent-act-2")
+
+
+@pytest.mark.asyncio
+async def test_file_consent_delete_failure_swallowed(
+    adapter, mock_aiohttp_put, caplog
+):
+    """A failed delete must not propagate or break the invoke handler."""
+    _register(adapter, "u1", chat_id="dm:user1", activity_id="consent-act-3")
+    activity = _make_consent_activity(
+        action="decline", context={"upload_id": "u1"}
+    )
+    ctx = _make_ctx(activity, conversation_id="dm:user1")
+    ctx._delete_mock.side_effect = RuntimeError("graph 404")
+
+    # Should not raise.
+    with caplog.at_level(logging.WARNING, logger="plugins.platforms.teams.adapter"):
+        result = await adapter._handle_file_consent_invoke(ctx)
+
+    assert result is None
+    # Warning logged.
+    assert any(
+        "consent" in rec.getMessage().lower() and "delete" in rec.getMessage().lower()
+        for rec in caplog.records
+    )

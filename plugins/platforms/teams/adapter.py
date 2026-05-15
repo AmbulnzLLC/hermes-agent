@@ -1847,6 +1847,7 @@ class TeamsAdapter(BasePlatformAdapter):
             logger.info(
                 "[teams] fileConsent declined for %s", pending["filename"]
             )
+            await self._delete_consent_card(ctx, pending)
             return None
 
         upload_info = value.upload_info
@@ -1864,6 +1865,11 @@ class TeamsAdapter(BasePlatformAdapter):
         if not success:
             return None
 
+        # Delete the consent card so the buttons don't sit grey-then-re-enabled.
+        # Done before the FileInfoCard so the user sees the card disappear
+        # then the file appear, rather than two cards stacked briefly.
+        await self._delete_consent_card(ctx, pending)
+
         # Post the FileInfoCard so the file renders as a native attachment.
         await self._post_file_info_card(
             chat_id=pending["chat_id"],
@@ -1873,6 +1879,41 @@ class TeamsAdapter(BasePlatformAdapter):
             reply_to=pending.get("reply_to"),
         )
         return None
+
+    async def _delete_consent_card(
+        self,
+        ctx: "ActivityContext[FileConsentInvokeActivity]",
+        pending: Dict[str, Any],
+    ) -> None:
+        """Delete the FileConsentCard activity that triggered this invoke.
+
+        Without this, Teams shows the card buttons greying out for a moment
+        then re-enabling — the card never reaches a resolved state in the
+        UI. Failures are swallowed and logged; consent-card cleanup must
+        never break the invoke handler (the upload itself already succeeded
+        / was declined).
+        """
+        activity_id = pending.get("activity_id")
+        if not activity_id:
+            # Older entries (or send_failed paths) won't have one.
+            return
+        try:
+            conversation_id = ctx.activity.conversation.id
+        except AttributeError:
+            logger.warning(
+                "[teams] consent-card delete skipped — no conversation.id on ctx"
+            )
+            return
+        try:
+            await ctx.api.conversations.activities(conversation_id).delete(
+                activity_id
+            )
+        except Exception as e:
+            logger.warning(
+                "[teams] consent-card delete failed for activity_id=%s: %s",
+                activity_id,
+                e,
+            )
 
     async def _put_consent_bytes(self, upload_url: str, data: bytes) -> bool:
         """PUT *data* to a OneDrive upload-session URL using the
@@ -1994,6 +2035,14 @@ class TeamsAdapter(BasePlatformAdapter):
                 "bytes dropped, user got no card",
                 upload_id,
             )
+        else:
+            # Stash the consent card's activity_id so the invoke handler
+            # can delete the card on Accept/Decline. Without this, Teams
+            # leaves the card buttons grey-then-re-enabled (no resolution
+            # state) — the user reports the card "doesn't go away".
+            entry = self._pending_uploads.get(upload_id)
+            if entry is not None:
+                entry["activity_id"] = result.message_id
         return result
 
     def _register_pending_upload(
