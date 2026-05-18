@@ -87,10 +87,37 @@ class TestAnthropicTransportGuardrailInjection:
             guardrail_config={
                 "guardrailIdentifier": "jp8n3921i7e8",
                 "guardrailVersion": "DRAFT",
-                "trace": "enabled",
+                "trace": "ENABLED",
             },
         )
-        assert kw["extra_headers"]["X-Amzn-Bedrock-Trace"] == "enabled"
+        assert kw["extra_headers"]["X-Amzn-Bedrock-Trace"] == "ENABLED"
+
+    def test_guardrail_trace_lowercase_normalized(self, transport):
+        """Bedrock InvokeModel rejects lowercase trace values — only
+        {ENABLED, ENABLED_FULL, DISABLED} are valid. The transport must
+        uppercase whatever the user wrote in config so common YAML conventions
+        (`trace: disabled`) don't 400 at the API.
+        """
+        msgs = [{"role": "user", "content": "Hello"}]
+        for raw, expected in (
+            ("disabled", "DISABLED"),
+            ("enabled", "ENABLED"),
+            ("enabled_full", "ENABLED_FULL"),
+            ("Disabled", "DISABLED"),
+        ):
+            kw = transport.build_kwargs(
+                model="claude-3-5-sonnet-20241022",
+                messages=msgs,
+                guardrail_config={
+                    "guardrailIdentifier": "jp8n3921i7e8",
+                    "guardrailVersion": "DRAFT",
+                    "trace": raw,
+                },
+            )
+            assert kw["extra_headers"]["X-Amzn-Bedrock-Trace"] == expected, (
+                f"trace={raw!r} → {kw['extra_headers']['X-Amzn-Bedrock-Trace']!r}, "
+                f"expected {expected!r}"
+            )
 
     def test_stream_processing_mode_ignored(self, transport):
         """streamProcessingMode is a Converse-API-only field — must not leak as a header."""
