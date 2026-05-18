@@ -1302,7 +1302,10 @@ def resolve_runtime_provider(
             if _gr.get("stream_processing_mode"):
                 guardrail_config["streamProcessingMode"] = _gr["stream_processing_mode"]
             if _gr.get("trace"):
-                guardrail_config["trace"] = _gr["trace"]
+                # Bedrock InvokeModel/Converse rejects lowercase trace values —
+                # accepted set is {ENABLED, ENABLED_FULL, DISABLED}. Normalize
+                # so YAML conventions like `trace: disabled` don't 400.
+                guardrail_config["trace"] = str(_gr["trace"]).upper()
         # Dual-path routing: Claude models use AnthropicBedrock SDK for full
         # feature parity (prompt caching, thinking budgets, adaptive thinking).
         # Non-Claude models use the Converse API for multi-model support.

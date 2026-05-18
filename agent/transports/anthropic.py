@@ -98,8 +98,12 @@ class AnthropicTransport(ProviderTransport):
             extra_headers = dict(kwargs.get("extra_headers") or {})
             extra_headers["X-Amzn-Bedrock-GuardrailIdentifier"] = guardrail["guardrailIdentifier"]
             extra_headers["X-Amzn-Bedrock-GuardrailVersion"] = guardrail["guardrailVersion"]
-            if guardrail.get("trace"):
-                extra_headers["X-Amzn-Bedrock-Trace"] = guardrail["trace"]
+            # Bedrock's InvokeModel API rejects lowercase trace values — the
+            # accepted set is {ENABLED, ENABLED_FULL, DISABLED}. Normalize so
+            # configs written as `trace: disabled` (or `enabled`) don't 400.
+            _trace = guardrail.get("trace")
+            if _trace:
+                extra_headers["X-Amzn-Bedrock-Trace"] = str(_trace).upper()
             kwargs["extra_headers"] = extra_headers
 
         return kwargs
