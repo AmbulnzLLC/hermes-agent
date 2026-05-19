@@ -105,6 +105,7 @@ from hermes_constants import OPENROUTER_BASE_URL
 from utils import base_url_host_matches, base_url_hostname, normalize_proxy_env_vars
 
 logger = logging.getLogger(__name__)
+logger.warning("VIGO-PATCH-MARKER auxiliary_client.py loaded (build 02f15cd2c, with_raw_response patch active)")
 
 
 def _safe_isinstance(obj: Any, maybe_type: Any) -> bool:
