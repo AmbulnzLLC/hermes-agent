@@ -116,6 +116,90 @@ def _install_bedrock_trace_logging(sdk: Any) -> None:
     )
 
 
+def _install_bedrock_decoder_logging(sdk: Any) -> None:
+    """Monkeypatch ``anthropic.lib.bedrock._stream_decoder.AWSEventStreamDecoder``
+    to log every raw EventStream frame's headers + event-type before botocore's
+    ``ResponseStream`` shape filter discards non-``chunk`` members.
+
+    The Anthropic Bedrock streaming path runs every wire frame through
+    ``EventStreamJSONParser.parse(response_dict, ResponseStream)``. The
+    ``ResponseStream`` shape (per botocore service-2) only declares ``chunk``
+    plus 6 exception members — anything else (including any hypothetical
+    ``amazon-bedrock-trace`` / ``amazon-bedrock-guardrailAction`` frames) is
+    silently dropped before reaching ``_iter_events``.
+
+    This patch wraps ``_parse_message_from_event`` to peek at the raw
+    ``event.to_response_dict()`` headers BEFORE the parser runs. If Bedrock's
+    streaming endpoint emits non-chunk frames at all, we'll see them here. If
+    we never see a non-``chunk`` ``:event-type`` header on the wire, the
+    streaming endpoint truly does not emit trace events and the only path to
+    guardrail trace data is post-hoc ``ApplyGuardrail``.
+
+    Idempotent — guarded by ``__hermes_bedrock_decoder_patched__``.
+
+    Failure is non-fatal: a single WARNING is logged and the decoder is left
+    unmodified.
+    """
+    log = logging.getLogger(__name__)
+    try:
+        from anthropic.lib.bedrock import _stream_decoder as decoder_mod
+        decoder_cls = decoder_mod.AWSEventStreamDecoder
+    except (ImportError, AttributeError) as exc:
+        log.warning(
+            "bedrock decoder logging: anthropic.lib.bedrock._stream_decoder."
+            "AWSEventStreamDecoder not found (sdk=%s) — raw event-type peek "
+            "will not run: %s",
+            getattr(sdk, "__version__", "?"), exc,
+        )
+        return
+
+    if getattr(decoder_cls, "__hermes_bedrock_decoder_patched__", False):
+        return
+
+    trace_log = logging.getLogger("agent.anthropic_adapter.bedrock_decoder")
+    _orig_parse = decoder_cls._parse_message_from_event
+
+    def _patched_parse_message_from_event(self, event):
+        try:
+            rd = event.to_response_dict()
+            headers = rd.get("headers", {}) or {}
+            event_type = headers.get(":event-type") or headers.get("event-type")
+            if event_type and event_type != "chunk":
+                # Non-chunk frame — botocore will drop this. Log everything we
+                # can about it before the original method discards it.
+                body = rd.get("body", b"")
+                try:
+                    body_preview = body[:1000].decode("utf-8", errors="replace")
+                except Exception:
+                    body_preview = repr(body[:1000])
+                trace_log.info(
+                    "bedrock raw event: type=%s headers=%s body=%s",
+                    event_type, headers, body_preview,
+                )
+            elif event_type == "chunk":
+                # Don't spam — chunk frames are the normal stream payload.
+                pass
+            else:
+                # No event-type header at all — log once at DEBUG so we know.
+                trace_log.debug(
+                    "bedrock raw event: no :event-type header headers=%s",
+                    headers,
+                )
+        except Exception as exc:  # pragma: no cover — never break the stream
+            trace_log.debug("bedrock raw event peek failed: %s", exc)
+        return _orig_parse(self, event)
+
+    decoder_cls._parse_message_from_event = _patched_parse_message_from_event
+    decoder_cls.__hermes_bedrock_decoder_patched__ = True
+
+    log.info(
+        "bedrock decoder logging: installed on anthropic.lib.bedrock."
+        "_stream_decoder.AWSEventStreamDecoder (sdk=%s) — raw non-chunk "
+        "EventStream frames will be logged at INFO",
+        getattr(sdk, "__version__", "?"),
+    )
+
+
 def _get_anthropic_sdk():
     """Return the ``anthropic`` SDK module, importing lazily. None if not installed."""
     global _anthropic_sdk
@@ -136,6 +220,12 @@ def _get_anthropic_sdk():
             except Exception as exc:  # pragma: no cover — defensive
                 logging.getLogger(__name__).warning(
                     "bedrock trace logging install failed: %s", exc,
+                )
+            try:
+                _install_bedrock_decoder_logging(_sdk)
+            except Exception as exc:  # pragma: no cover — defensive
+                logging.getLogger(__name__).warning(
+                    "bedrock decoder logging install failed: %s", exc,
                 )
         except ImportError:
             _anthropic_sdk = None
