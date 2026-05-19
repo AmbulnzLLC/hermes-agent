@@ -44,9 +44,6 @@ def _log_bedrock_guardrail_trace(response: Any) -> None:
             response, "amazon_bedrock_invocation_metrics", None
         )
 
-        if not trace:
-            return
-
         # The trace dict's `guardrail` key is what compliance cares about:
         # it lists which filter (topic, content, sensitive_info, contextual
         # grounding, word) intervened, the action taken, and the per-filter
