@@ -44,6 +44,12 @@ def _log_bedrock_guardrail_trace(response: Any) -> None:
             response, "amazon_bedrock_invocation_metrics", None
         )
 
+        # No trace data on the response — silent. Most calls hit this path:
+        # the guardrail didn't intervene (ENABLED mode) or the request didn't
+        # ask for tracing at all.
+        if not trace:
+            return
+
         # The trace dict's `guardrail` key is what compliance cares about:
         # it lists which filter (topic, content, sensitive_info, contextual
         # grounding, word) intervened, the action taken, and the per-filter
@@ -161,15 +167,6 @@ class AnthropicTransport(ProviderTransport):
             if _trace:
                 extra_headers["X-Amzn-Bedrock-Trace"] = str(_trace).upper()
             kwargs["extra_headers"] = extra_headers
-            logger.info(
-                "bedrock guardrail headers attached: %s",
-                sorted(extra_headers.keys()),
-            )
-        else:
-            logger.info(
-                "bedrock guardrail headers NOT attached: guardrail_config=%r",
-                guardrail,
-            )
 
         return kwargs
 
@@ -195,22 +192,6 @@ class AnthropicTransport(ProviderTransport):
         # steady-state noise is zero and a log line is a real signal.
         # `ENABLED_FULL` emits on every assessment — louder, but still useful
         # for tuning thresholds.
-        try:
-            import json as _json
-            _dump = response.model_dump() if hasattr(response, "model_dump") else vars(response)
-            logger.info("bedrock response dump: %s", _json.dumps(_dump, default=str))
-            # Anthropic SDK exposes raw HTTP response via _request_id / __dict__
-            logger.info("bedrock response __dict__ keys: %s", list(response.__dict__.keys()) if hasattr(response, "__dict__") else None)
-            logger.info("bedrock response model_extra: %r", getattr(response, "model_extra", "<missing>"))
-            # The withRawResponse pattern stashes headers on _response or http_response
-            for attr in ("_response", "http_response", "response", "_raw_response"):
-                if hasattr(response, attr):
-                    val = getattr(response, attr)
-                    logger.info("bedrock response.%s = %r", attr, val)
-                    if hasattr(val, "headers"):
-                        logger.info("bedrock response.%s.headers = %r", attr, dict(val.headers))
-        except Exception as _e:
-            logger.info("bedrock response dump failed: %s; repr=%r", _e, response)
         _log_bedrock_guardrail_trace(response)
 
         strip_tool_prefix = kwargs.get("strip_tool_prefix", False)

@@ -105,7 +105,6 @@ from hermes_constants import OPENROUTER_BASE_URL
 from utils import base_url_host_matches, base_url_hostname, normalize_proxy_env_vars
 
 logger = logging.getLogger(__name__)
-logger.warning("VIGO-PATCH-MARKER auxiliary_client.py loaded (build 02f15cd2c, with_raw_response patch active)")
 
 
 def _safe_isinstance(obj: Any, maybe_type: Any) -> bool:
@@ -985,42 +984,7 @@ class _AnthropicCompletionsAdapter:
             if not _forbids_sampling_params(model):
                 anthropic_kwargs["temperature"] = temperature
 
-        # Use with_raw_response to capture the pre-pydantic HTTP response.
-        # On Bedrock, guardrail trace + invocation-metrics arrive as extra
-        # JSON keys (`amazon-bedrock-trace`, `amazon-bedrock-guardrailAction`,
-        # `amazon-bedrock-invocationMetrics`) that the AnthropicBedrock SDK
-        # discards when parsing the body into a Message object.  Logging the
-        # raw .text + response headers gives us a definitive view of what
-        # Bedrock actually sent before pydantic ate it.
-        try:
-            _raw = self._client.messages.with_raw_response.create(**anthropic_kwargs)
-            try:
-                logger.info(
-                    "bedrock raw response: status=%s request_id=%s headers=%s",
-                    getattr(_raw, "status_code", "?"),
-                    getattr(_raw, "request_id", "?"),
-                    dict(getattr(_raw, "headers", {}) or {}),
-                )
-                _raw_text = getattr(_raw, "text", None)
-                if _raw_text is not None:
-                    logger.info("bedrock raw body: %s", _raw_text[:16000])
-                # Also log what we sent on the wire — confirms guardrail
-                # headers survived SDK serialization.
-                _httpreq = getattr(_raw, "http_request", None)
-                if _httpreq is not None:
-                    _req_headers = dict(getattr(_httpreq, "headers", {}) or {})
-                    # Redact Authorization but keep Bedrock guardrail headers visible.
-                    if "authorization" in {k.lower() for k in _req_headers}:
-                        for k in list(_req_headers.keys()):
-                            if k.lower() == "authorization":
-                                _req_headers[k] = "<redacted>"
-                    logger.info("bedrock raw request headers: %s", _req_headers)
-            except Exception as _logexc:
-                logger.info("bedrock raw response logging failed: %s", _logexc)
-            response = _raw.parse()
-        except AttributeError:
-            # Older SDKs lacking with_raw_response — fall back to plain create.
-            response = self._client.messages.create(**anthropic_kwargs)
+        response = self._client.messages.create(**anthropic_kwargs)
         _transport = get_transport("anthropic_messages")
         _nr = _transport.normalize_response(
             response, strip_tool_prefix=self._is_oauth

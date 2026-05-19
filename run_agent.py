@@ -8314,21 +8314,6 @@ class AIAgent:
                                     self._fire_reasoning_delta(thinking_text)
 
                 # Return the native Anthropic Message for downstream processing
-                # Surface diagnostic headers on successful streams (Bedrock
-                # guardrail trace, x-amzn-requestid, etc).  These are captured
-                # at stream open via _stream_diag_capture_response but were
-                # previously only logged on retry errors.
-                try:
-                    _diag_headers = _diag.get("headers") if isinstance(_diag, dict) else None
-                    _diag_status = _diag.get("http_status") if isinstance(_diag, dict) else None
-                    if _diag_headers:
-                        logger.info(
-                            "anthropic stream diag: status=%s headers=%s",
-                            _diag_status,
-                            _diag_headers,
-                        )
-                except Exception:
-                    pass
                 return stream.get_final_message()
 
         def _call():
