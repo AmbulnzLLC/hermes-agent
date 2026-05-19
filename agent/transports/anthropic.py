@@ -13,65 +13,6 @@ from agent.transports.types import NormalizedResponse
 logger = logging.getLogger(__name__)
 
 
-def _log_bedrock_guardrail_trace(response: Any) -> None:
-    """Emit a log line when Bedrock returned a guardrail trace.
-
-    Bedrock attaches the trace as `amazon-bedrock-trace` (and supporting
-    `amazon-bedrock-invocationMetrics`) to the InvokeModel response body.
-    The AnthropicBedrock SDK drops these into pydantic's `model_extra`
-    catch-all because the typed Anthropic Message schema doesn't declare
-    them.  We pull from there, with `getattr` fallbacks for SDK versions
-    that surface them as direct attributes.
-
-    No-op when the trace block is absent (the request didn't ask for it,
-    or `ENABLED` mode and the guardrail didn't intervene).  Best-effort —
-    swallows exceptions so a logging hiccup never breaks a real response.
-    """
-    try:
-        extras: Dict[str, Any] = {}
-        model_extra = getattr(response, "model_extra", None)
-        if isinstance(model_extra, dict):
-            extras = model_extra
-
-        # Two known-on-the-wire keys.  `amazon-bedrock-trace` carries the
-        # guardrail assessment block; `amazon-bedrock-invocationMetrics`
-        # carries token + latency counts.  Both can also live as direct
-        # attributes depending on SDK version, so try both spellings.
-        trace = extras.get("amazon-bedrock-trace") or getattr(
-            response, "amazon_bedrock_trace", None
-        )
-        metrics = extras.get("amazon-bedrock-invocationMetrics") or getattr(
-            response, "amazon_bedrock_invocation_metrics", None
-        )
-
-        # No trace data on the response — silent. Most calls hit this path:
-        # the guardrail didn't intervene (ENABLED mode) or the request didn't
-        # ask for tracing at all.
-        if not trace:
-            return
-
-        # The trace dict's `guardrail` key is what compliance cares about:
-        # it lists which filter (topic, content, sensitive_info, contextual
-        # grounding, word) intervened, the action taken, and the per-filter
-        # confidence.  Log the whole thing — JSON-serialized for grep-ability
-        # and to keep the structured payload intact for downstream parsing.
-        import json
-
-        payload: Dict[str, Any] = {"trace": trace}
-        if metrics:
-            payload["metrics"] = metrics
-        msg_id = getattr(response, "id", None)
-        if msg_id:
-            payload["message_id"] = msg_id
-
-        logger.info(
-            "bedrock guardrail trace: %s",
-            json.dumps(payload, default=str, sort_keys=True),
-        )
-    except Exception as e:  # noqa: BLE001 — never let logging break the response
-        logger.debug("failed to surface bedrock guardrail trace: %s", e)
-
-
 class AnthropicTransport(ProviderTransport):
     """Transport for api_mode='anthropic_messages'.
 
@@ -179,20 +120,6 @@ class AnthropicTransport(ProviderTransport):
         import json
         from agent.anthropic_adapter import _to_plain_data
         from agent.transports.types import ToolCall
-
-        # Bedrock guardrail trace surfacing.  When X-Amzn-Bedrock-Trace=ENABLED
-        # is sent on the request, Bedrock includes guardrail trace and
-        # invocation metrics in the response.  The AnthropicBedrock SDK lets
-        # these fall into pydantic's `model_extra` since the Anthropic Message
-        # schema doesn't declare them.  Without explicit logging here that
-        # data is dropped on the floor — costing payload bandwidth for zero
-        # visibility.
-        #
-        # `ENABLED` only emits a trace when the guardrail intervenes, so
-        # steady-state noise is zero and a log line is a real signal.
-        # `ENABLED_FULL` emits on every assessment — louder, but still useful
-        # for tuning thresholds.
-        _log_bedrock_guardrail_trace(response)
 
         strip_tool_prefix = kwargs.get("strip_tool_prefix", False)
         _MCP_PREFIX = "mcp_"
