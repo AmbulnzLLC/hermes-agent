@@ -161,6 +161,15 @@ class AnthropicTransport(ProviderTransport):
             if _trace:
                 extra_headers["X-Amzn-Bedrock-Trace"] = str(_trace).upper()
             kwargs["extra_headers"] = extra_headers
+            logger.info(
+                "bedrock guardrail headers attached: %s",
+                sorted(extra_headers.keys()),
+            )
+        else:
+            logger.info(
+                "bedrock guardrail headers NOT attached: guardrail_config=%r",
+                guardrail,
+            )
 
         return kwargs
 
