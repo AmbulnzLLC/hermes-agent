@@ -195,6 +195,12 @@ class AnthropicTransport(ProviderTransport):
         # steady-state noise is zero and a log line is a real signal.
         # `ENABLED_FULL` emits on every assessment — louder, but still useful
         # for tuning thresholds.
+        try:
+            import json as _json
+            _dump = response.model_dump() if hasattr(response, "model_dump") else vars(response)
+            logger.info("bedrock response dump: %s", _json.dumps(_dump, default=str))
+        except Exception as _e:
+            logger.info("bedrock response dump failed: %s; repr=%r", _e, response)
         _log_bedrock_guardrail_trace(response)
 
         strip_tool_prefix = kwargs.get("strip_tool_prefix", False)
