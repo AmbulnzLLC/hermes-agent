@@ -4,13 +4,10 @@ Delegates to the existing adapter functions in agent/anthropic_adapter.py.
 This transport owns format conversion and normalization — NOT client lifecycle.
 """
 
-import logging
 from typing import Any, Dict, List, Optional
 
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse
-
-logger = logging.getLogger(__name__)
 
 
 class AnthropicTransport(ProviderTransport):
