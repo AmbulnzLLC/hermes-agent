@@ -1,15 +1,21 @@
 """Seed admin-managed config keys at container boot.
 
-Reads BEDROCK_GUARDRAIL_ID and BEDROCK_GUARDRAIL_VERSION from the environment
-and writes them into ``$HERMES_HOME/config.yaml`` under ``bedrock.guardrail``.
-Designed for pilot/multi-tenant container deployments where the operator
-provisions the guardrail identity via Kubernetes secrets / env injection
-rather than baking it into the image.
+Reads BEDROCK_GUARDRAIL_ID, BEDROCK_GUARDRAIL_VERSION, and (optionally)
+BEDROCK_GUARDRAIL_TRACE from the environment and writes them into
+``$HERMES_HOME/config.yaml`` under ``bedrock.guardrail``.  Designed for
+pilot/multi-tenant container deployments where the operator provisions the
+guardrail identity via Kubernetes secrets / env injection rather than baking
+it into the image.
 
 Behavior:
-- Both env vars must be set and non-empty; otherwise this script is a no-op.
+- BEDROCK_GUARDRAIL_ID and BEDROCK_GUARDRAIL_VERSION must both be set and
+  non-empty; otherwise this script is a no-op (no trace seeding either).
+- BEDROCK_GUARDRAIL_TRACE is optional.  When set, it must be one of
+  ``ENABLED``, ``ENABLED_FULL``, ``DISABLED`` (case-insensitive — normalized
+  to upper-case on write).  Anything else is rejected with a non-zero exit
+  so misconfigurations crash-loop rather than silently disabling tracing.
 - Runs on every container boot.  Idempotent when env values already match.
-- Preserves all other keys in config.yaml — only the two guardrail leaves are
+- Preserves all other keys in config.yaml — only the guardrail leaves are
   touched.  ``setdefault`` is used at every level so adjacent keys under
   ``bedrock`` (e.g. ``region``, ``discovery``) are left untouched.
 - Fails open: a pre-existing YAML parse error in config.yaml causes this
@@ -37,12 +43,26 @@ def main() -> int:
 
     guardrail_id = os.environ.get("BEDROCK_GUARDRAIL_ID", "").strip()
     guardrail_version = os.environ.get("BEDROCK_GUARDRAIL_VERSION", "").strip()
+    guardrail_trace_raw = os.environ.get("BEDROCK_GUARDRAIL_TRACE", "").strip()
 
     if not (guardrail_id and guardrail_version):
         # Nothing to seed — this image build / deployment doesn't pin a
         # guardrail.  Silent no-op so generic (non-pilot) deploys aren't
         # noisy.
         return 0
+
+    guardrail_trace: str | None = None
+    if guardrail_trace_raw:
+        normalized = guardrail_trace_raw.upper()
+        valid = {"ENABLED", "ENABLED_FULL", "DISABLED"}
+        if normalized not in valid:
+            print(
+                f"[seed_admin_config] ERROR: BEDROCK_GUARDRAIL_TRACE={guardrail_trace_raw!r} "
+                f"is not one of {sorted(valid)}; refusing to boot",
+                file=sys.stderr,
+            )
+            return 1
+        guardrail_trace = normalized
 
     cfg: dict = {}
     if config_path.exists():
@@ -89,20 +109,34 @@ def main() -> int:
     # restart for no reason.
     existing_id = guardrail.get("guardrail_identifier")
     existing_version = guardrail.get("guardrail_version")
-    if existing_id == guardrail_id and existing_version == guardrail_version:
+    existing_trace = guardrail.get("trace")
+    if (
+        existing_id == guardrail_id
+        and existing_version == guardrail_version
+        and existing_trace == guardrail_trace
+    ):
         print(
             f"[seed_admin_config] bedrock.guardrail already matches env "
-            f"(id={guardrail_id!r}, version={guardrail_version!r}); no write"
+            f"(id={guardrail_id!r}, version={guardrail_version!r}, "
+            f"trace={guardrail_trace!r}); no write"
         )
         return 0
 
     guardrail["guardrail_identifier"] = guardrail_id
     guardrail["guardrail_version"] = guardrail_version
+    if guardrail_trace is not None:
+        guardrail["trace"] = guardrail_trace
+    elif "trace" in guardrail:
+        # Operator removed BEDROCK_GUARDRAIL_TRACE — clear the seeded value
+        # so the transport falls back to its no-trace default rather than
+        # carrying a stale setting forward.
+        del guardrail["trace"]
 
     config_path.write_text(yaml.safe_dump(cfg, sort_keys=False))
     print(
         f"[seed_admin_config] wrote bedrock.guardrail to {config_path} "
-        f"(id={guardrail_id!r}, version={guardrail_version!r})"
+        f"(id={guardrail_id!r}, version={guardrail_version!r}, "
+        f"trace={guardrail_trace!r})"
     )
     return 0
 
