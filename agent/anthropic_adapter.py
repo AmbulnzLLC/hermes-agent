@@ -31,6 +31,91 @@ from utils import base_url_host_matches, normalize_proxy_env_vars
 _anthropic_sdk: Any = ...  # sentinel — None means "tried and missing"
 
 
+def _install_bedrock_trace_logging(sdk: Any) -> None:
+    """Monkeypatch ``anthropic._streaming.Stream._iter_events`` to log Bedrock-specific
+    SSE chunks that the SDK would otherwise silently drop.
+
+    Bedrock's ``InvokeModelWithResponseStream`` interleaves AWS-only event types
+    (``amazon-bedrock-trace``, ``amazon-bedrock-guardrailAction``) with the standard
+    Anthropic event stream. Those chunks carry guardrail trace data — which policy
+    fired, which topic/word/content rule matched, etc. The Anthropic SDK's
+    ``Stream.__stream__`` only dispatches a hardcoded allowlist of Anthropic event
+    types and discards everything else, so the trace data never reaches our
+    application code.
+
+    This patch wraps ``_iter_events`` (the chokepoint where every raw SSE flows by
+    once, before the filter) and emits an INFO log for each ``amazon-bedrock-*``
+    event. The SSE itself is yielded unchanged, so downstream parsing is untouched.
+
+    Idempotent — guarded by ``Stream.__hermes_bedrock_trace_patched__`` so multiple
+    calls (e.g. via ``_get_anthropic_sdk()`` re-entry) only install once.
+
+    Failure here is non-fatal: a single WARNING is logged and the SDK is left
+    unmodified, so an upstream rename of ``Stream._iter_events`` degrades to a
+    silent loss of trace logging rather than crashing the import.
+    """
+    log = logging.getLogger(__name__)
+    try:
+        streaming_mod = sdk._streaming
+        sync_cls = streaming_mod.Stream
+        async_cls = streaming_mod.AsyncStream
+    except AttributeError as exc:
+        log.warning(
+            "bedrock trace logging: anthropic._streaming.Stream/AsyncStream not "
+            "found (sdk=%s) — guardrail trace events will not be logged: %s",
+            getattr(sdk, "__version__", "?"), exc,
+        )
+        return
+
+    if getattr(sync_cls, "__hermes_bedrock_trace_patched__", False):
+        return
+
+    trace_log = logging.getLogger("agent.anthropic_adapter.bedrock_trace")
+
+    def _maybe_log(sse: Any) -> None:
+        # ``sse.event`` is None for unnamed events; Bedrock chunks always have a name.
+        event_name = getattr(sse, "event", None)
+        if not event_name or not event_name.startswith("amazon-bedrock-"):
+            return
+        try:
+            payload = sse.json()
+        except Exception:
+            payload = sse.data  # raw string fallback when not JSON
+        trace_log.info("bedrock stream event: event=%s payload=%s", event_name, payload)
+
+    _orig_sync_iter = sync_cls._iter_events
+
+    def _patched_sync_iter_events(self):
+        for sse in _orig_sync_iter(self):
+            _maybe_log(sse)
+            yield sse
+
+    sync_cls._iter_events = _patched_sync_iter_events
+    sync_cls.__hermes_bedrock_trace_patched__ = True
+
+    # Async path — patched even though the gateway is sync, in case auxiliary
+    # paths use AsyncAnthropicBedrock.
+    try:
+        _orig_async_iter = async_cls._iter_events
+
+        async def _patched_async_iter_events(self):
+            async for sse in _orig_async_iter(self):
+                _maybe_log(sse)
+                yield sse
+
+        async_cls._iter_events = _patched_async_iter_events
+        async_cls.__hermes_bedrock_trace_patched__ = True
+    except AttributeError:
+        # AsyncStream surface differs — sync path is the one we actually need.
+        pass
+
+    log.info(
+        "bedrock trace logging: installed on anthropic._streaming.Stream "
+        "(sdk=%s) — amazon-bedrock-* SSE events will be logged at INFO",
+        getattr(sdk, "__version__", "?"),
+    )
+
+
 def _get_anthropic_sdk():
     """Return the ``anthropic`` SDK module, importing lazily. None if not installed."""
     global _anthropic_sdk
@@ -46,6 +131,12 @@ def _get_anthropic_sdk():
         try:
             import anthropic as _sdk
             _anthropic_sdk = _sdk
+            try:
+                _install_bedrock_trace_logging(_sdk)
+            except Exception as exc:  # pragma: no cover — defensive
+                logging.getLogger(__name__).warning(
+                    "bedrock trace logging install failed: %s", exc,
+                )
         except ImportError:
             _anthropic_sdk = None
     return _anthropic_sdk
