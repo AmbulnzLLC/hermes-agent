@@ -199,6 +199,16 @@ class AnthropicTransport(ProviderTransport):
             import json as _json
             _dump = response.model_dump() if hasattr(response, "model_dump") else vars(response)
             logger.info("bedrock response dump: %s", _json.dumps(_dump, default=str))
+            # Anthropic SDK exposes raw HTTP response via _request_id / __dict__
+            logger.info("bedrock response __dict__ keys: %s", list(response.__dict__.keys()) if hasattr(response, "__dict__") else None)
+            logger.info("bedrock response model_extra: %r", getattr(response, "model_extra", "<missing>"))
+            # The withRawResponse pattern stashes headers on _response or http_response
+            for attr in ("_response", "http_response", "response", "_raw_response"):
+                if hasattr(response, attr):
+                    val = getattr(response, attr)
+                    logger.info("bedrock response.%s = %r", attr, val)
+                    if hasattr(val, "headers"):
+                        logger.info("bedrock response.%s.headers = %r", attr, dict(val.headers))
         except Exception as _e:
             logger.info("bedrock response dump failed: %s; repr=%r", _e, response)
         _log_bedrock_guardrail_trace(response)
