@@ -122,6 +122,21 @@ if [ -f "$INSTALL_DIR/docker/seed_admin_config.py" ]; then
         echo "Warning: seed_admin_config.py exited non-zero — continuing"
 fi
 
+# Seed admin-managed skills-hub taps from HERMES_DEFAULT_TAPS, if provided.
+# Pairs with install_github_app_pem.py (the PEM provides outbound auth;
+# this registers the private repo(s) that use it) so the AmbulnzLLC pilot
+# (and any deployment shipping private skill repos) gets its shared
+# skills tap auto-registered without a post-deploy `hermes skills tap add`.
+# Format is comma- or newline-separated "owner/repo[@path]" or full URL.
+# This is a SEED, not a lock — the hermes user can `hermes skills tap
+# remove` afterwards; entries will be re-seeded on the next boot.
+# Idempotent: skips entries already in taps.json.  Silent no-op when the
+# env var is unset (generic deploys).  See docker/seed_taps.py for details.
+if [ -f "$INSTALL_DIR/docker/seed_taps.py" ]; then
+    python3 "$INSTALL_DIR/docker/seed_taps.py" || \
+        echo "Warning: seed_taps.py exited non-zero — continuing"
+fi
+
 # SOUL.md is provisioned in the root section above (root-owned, 0444), not here,
 # so the hermes user cannot rewrite it.
 
