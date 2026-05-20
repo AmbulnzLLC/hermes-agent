@@ -67,6 +67,24 @@ if [ "$(id -u)" = "0" ]; then
         chmod 0444 "$HERMES_HOME/SOUL.md" 2>/dev/null || true
     fi
 
+    # GitHub App PEM — admin-managed credential for outbound git/GitHub API
+    # auth (skills-hub private taps, gh CLI, raw `git clone`).  When
+    # GITHUB_APP_PEM_SECRET_ID is set, fetch the PEM from AWS Secrets
+    # Manager and drop it at GITHUB_APP_PEM_DEST_PATH (default
+    # /opt/data/secrets/github-app.pem) as hermes:hermes mode 0400.  Once
+    # in place, Hermes's built-in GitHubAuth._try_github_app() picks it up
+    # via GITHUB_APP_ID / GITHUB_APP_INSTALLATION_ID / GITHUB_APP_PRIVATE_KEY_PATH
+    # and mints installation tokens automatically.  Silent no-op when the
+    # secret-id env var is unset (generic deploys).  Crashes the boot on
+    # any error when set — a misconfigured pilot pod must crash-loop, not
+    # serve traffic without working GitHub auth.  Must run while still
+    # root (before the gosu drop) so the chown/chmod take effect.  Uses
+    # the venv's python because boto3 lives in the bedrock extra and the
+    # venv is not yet activated at this point.
+    if [ -f "$INSTALL_DIR/docker/install_github_app_pem.py" ]; then
+        "$INSTALL_DIR/.venv/bin/python3" "$INSTALL_DIR/docker/install_github_app_pem.py"
+    fi
+
     echo "Dropping root privileges"
     exec gosu hermes "$0" "$@"
 fi
