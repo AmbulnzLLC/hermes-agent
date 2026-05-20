@@ -39,8 +39,14 @@ Behavior:
   investigate at leisure.  Compare ``install_github_app_pem.py``, which
   *does* crash on failure — credentials are a hard prerequisite, but
   individual skill installs are a soft one.
-- Forbids the ``--force`` flag.  An admin-baked install pipeline must
-  not auto-bypass scan verdicts; that's a manual decision.
+- Uses ``--force`` so admin-managed default skills install even when the
+  scanner returns a ``caution`` or ``dangerous`` verdict.  Rationale: this
+  seed list is curated by the deployment admin (not a community drop), so
+  individual scan findings have already been reviewed out-of-band; the
+  alternative is every fresh pod missing org-shared skills until an operator
+  manually re-runs the install with ``--force``, which defeats the seeder's
+  purpose.  If you want scan verdicts respected on a per-skill basis, drop
+  the entry from ``HERMES_DEFAULT_SKILLS`` and install it interactively.
 
 This is a SEED, not a lock.  After boot the hermes runtime user can
 ``hermes skills uninstall <name>`` and the skill stays gone for the
@@ -162,7 +168,9 @@ def _install_one(identifier: str, name_override: str) -> bool:
         do_install(
             identifier,
             category="",
-            force=False,            # admin-baked path must NOT bypass scans
+            force=True,             # admin-curated seed list — bypass scan
+                                    # verdicts so org-shared skills install on
+                                    # every fresh pod without operator action.
             skip_confirm=True,      # non-interactive boot
             invalidate_cache=False, # avoid thrashing the index cache per skill
             name_override=name_override,
