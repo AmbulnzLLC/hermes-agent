@@ -1581,8 +1581,30 @@ class AIAgent:
                 self.api_key = "aws-sdk"
                 self.client = None
                 self._client_kwargs = {}
+                # Guardrail config — read from config.yaml at init time so the
+                # AnthropicBedrock path can attach guardrails to every InvokeModel
+                # call (mirrors the bedrock_converse branch below). Without this,
+                # `bedrock.guardrail.*` config is silently dropped on Claude models
+                # because the AnthropicBedrock SDK doesn't accept `guardrailConfig`
+                # natively — it must be sent via X-Amzn-Bedrock-Guardrail* headers.
+                self._bedrock_guardrail_config = None
+                try:
+                    from hermes_cli.config import load_config as _load_br_cfg
+                    _gr = _load_br_cfg().get("bedrock", {}).get("guardrail", {})
+                    if _gr.get("guardrail_identifier") and _gr.get("guardrail_version"):
+                        self._bedrock_guardrail_config = {
+                            "guardrailIdentifier": _gr["guardrail_identifier"],
+                            "guardrailVersion": _gr["guardrail_version"],
+                        }
+                        if _gr.get("stream_processing_mode"):
+                            self._bedrock_guardrail_config["streamProcessingMode"] = _gr["stream_processing_mode"]
+                        if _gr.get("trace"):
+                            self._bedrock_guardrail_config["trace"] = _gr["trace"]
+                except Exception:
+                    pass
                 if not self.quiet_mode:
-                    print(f"🤖 AI Agent initialized with model: {self.model} (AWS Bedrock + AnthropicBedrock SDK, {_br_region})")
+                    _gr_label = " + Guardrails" if self._bedrock_guardrail_config else ""
+                    print(f"🤖 AI Agent initialized with model: {self.model} (AWS Bedrock + AnthropicBedrock SDK, {_br_region}{_gr_label})")
             else:
                 # Only fall back to ANTHROPIC_TOKEN when the provider is actually Anthropic.
                 # Other anthropic_messages providers (MiniMax, Alibaba, etc.) must use their own API key.
@@ -2935,6 +2957,16 @@ class AIAgent:
         "via",
         "server",
         "x-forwarded-for",
+        # AWS Bedrock diagnostic headers (request id, perf config, service tier,
+        # guardrail action / trace markers).  Critical for Bedrock guardrail
+        # debugging: confirms inbound trace headers + surfaces guardrail action.
+        "x-amzn-requestid",
+        "x-amzn-bedrock-performanceconfig-latency",
+        "x-amzn-bedrock-service-tier",
+        "x-amzn-bedrock-guardrailaction",
+        "x-amzn-bedrock-trace",
+        "x-amzn-bedrock-guardrailidentifier",
+        "x-amzn-bedrock-guardrailversion",
     )
 
     @staticmethod
@@ -9601,6 +9633,9 @@ class AIAgent:
                 base_url=getattr(self, "_anthropic_base_url", None),
                 fast_mode=(self.request_overrides or {}).get("speed") == "fast",
                 drop_context_1m_beta=bool(getattr(self, "_oauth_1m_beta_disabled", False)),
+                # Bedrock-on-Anthropic-SDK only: forwarded as X-Amzn-Bedrock-Guardrail*
+                # headers by the transport. None on direct-Anthropic / MiniMax / etc.
+                guardrail_config=getattr(self, "_bedrock_guardrail_config", None),
             )
 
         # AWS Bedrock native Converse API — bypasses the OpenAI client entirely.

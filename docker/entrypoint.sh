@@ -54,6 +54,19 @@ if [ "$(id -u)" = "0" ]; then
         chmod 640 "$HERMES_HOME/config.yaml" 2>/dev/null || true
     fi
 
+    # SOUL.md — admin-managed identity slot.  Overwritten on every boot from
+    # the image-baked copy so the hermes runtime user cannot drift it.  Owned
+    # by root and mode 0444 so even though the volume is hermes-writable, the
+    # file itself is not.  Personality customization is delegated to
+    # agent.personalities in config.yaml; SOUL.md only carries the breadcrumb
+    # pointing there.  Must run while still root (before the gosu drop) so
+    # the chown/chmod actually take effect.
+    if [ -f "$INSTALL_DIR/docker/SOUL.md" ]; then
+        cp "$INSTALL_DIR/docker/SOUL.md" "$HERMES_HOME/SOUL.md"
+        chown root:root "$HERMES_HOME/SOUL.md" 2>/dev/null || true
+        chmod 0444 "$HERMES_HOME/SOUL.md" 2>/dev/null || true
+    fi
+
     echo "Dropping root privileges"
     exec gosu hermes "$0" "$@"
 fi
@@ -80,10 +93,19 @@ if [ ! -f "$HERMES_HOME/config.yaml" ]; then
     cp "$INSTALL_DIR/cli-config.yaml.example" "$HERMES_HOME/config.yaml"
 fi
 
-# SOUL.md
-if [ ! -f "$HERMES_HOME/SOUL.md" ]; then
-    cp "$INSTALL_DIR/docker/SOUL.md" "$HERMES_HOME/SOUL.md"
+# Seed admin-managed bedrock guardrail config from env vars, if provided.
+# This is a SEED, not a lock — the user remains free to edit config.yaml.
+# Real enforcement that every Bedrock call carries the guardrail must come
+# from the IAM layer (bedrock:GuardrailIdentifier condition on the pod role).
+# Idempotent: skips the write when the file already matches env.  Safe to
+# run on every boot.  See docker/seed_admin_config.py for behavior details.
+if [ -f "$INSTALL_DIR/docker/seed_admin_config.py" ]; then
+    python3 "$INSTALL_DIR/docker/seed_admin_config.py" || \
+        echo "Warning: seed_admin_config.py exited non-zero — continuing"
 fi
+
+# SOUL.md is provisioned in the root section above (root-owned, 0444), not here,
+# so the hermes user cannot rewrite it.
 
 # auth.json: bootstrap from env on first boot only.  Used by orchestrators
 # (e.g. provisioning a Hermes VPS from an account-management service) that

@@ -59,10 +59,17 @@ class AnthropicTransport(ProviderTransport):
             base_url: str | None
             fast_mode: bool
             drop_context_1m_beta: bool
+            guardrail_config: dict | None — Bedrock guardrails. When set,
+                injects X-Amzn-Bedrock-Guardrail{Identifier,Version,Trace}
+                headers via extra_headers on the AnthropicBedrock SDK call.
+                Keys consumed: guardrailIdentifier, guardrailVersion, trace.
+                (streamProcessingMode is Converse-API-only and ignored here.)
+                Caller is responsible for only setting this on Bedrock; the
+                transport itself does not gate by provider.
         """
         from agent.anthropic_adapter import build_anthropic_kwargs
 
-        return build_anthropic_kwargs(
+        kwargs = build_anthropic_kwargs(
             model=model,
             messages=messages,
             tools=tools,
@@ -76,6 +83,30 @@ class AnthropicTransport(ProviderTransport):
             fast_mode=params.get("fast_mode", False),
             drop_context_1m_beta=params.get("drop_context_1m_beta", False),
         )
+
+        # Bedrock guardrail header injection.
+        # The AnthropicBedrock SDK doesn't expose a `guardrailConfig` parameter
+        # (that's a Converse-API field), so guardrails on the AnthropicBedrock
+        # path must be sent as HTTP headers per the Bedrock InvokeModel spec:
+        # https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_InvokeModel.html
+        # These headers are also what the IAM `bedrock:GuardrailIdentifier`
+        # condition key checks against, so they're load-bearing for IAM-enforced
+        # guardrail policies — without them, IAM Deny statements on the policy
+        # cause every Claude-on-Bedrock InvokeModel call to 403.
+        guardrail = params.get("guardrail_config")
+        if guardrail and guardrail.get("guardrailIdentifier") and guardrail.get("guardrailVersion"):
+            extra_headers = dict(kwargs.get("extra_headers") or {})
+            extra_headers["X-Amzn-Bedrock-GuardrailIdentifier"] = guardrail["guardrailIdentifier"]
+            extra_headers["X-Amzn-Bedrock-GuardrailVersion"] = guardrail["guardrailVersion"]
+            # Bedrock's InvokeModel API rejects lowercase trace values — the
+            # accepted set is {ENABLED, ENABLED_FULL, DISABLED}. Normalize so
+            # configs written as `trace: disabled` (or `enabled`) don't 400.
+            _trace = guardrail.get("trace")
+            if _trace:
+                extra_headers["X-Amzn-Bedrock-Trace"] = str(_trace).upper()
+            kwargs["extra_headers"] = extra_headers
+
+        return kwargs
 
     def normalize_response(self, response: Any, **kwargs) -> NormalizedResponse:
         """Normalize Anthropic response to NormalizedResponse.
