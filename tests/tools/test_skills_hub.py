@@ -1527,6 +1527,56 @@ class TestQuarantineBundleBinaryAssets:
 
         assert not absolute_target.exists()
 
+    def test_quarantine_bundle_preserves_executable_bit(self, tmp_path):
+        """Files listed in ``executable_paths`` get chmod 0o755 on disk.
+
+        Regression guard for the ``get-token.sh`` exec-bit loss: the
+        GitHub source surfaces ``executable_paths`` from git tree mode
+        100755 entries, and ``quarantine_bundle`` must apply chmod 0o755
+        so the bit survives ``shutil.move`` into the final install dir.
+        Files NOT in the set must keep the umask-default mode (no chmod).
+        """
+        import os
+        import stat
+        import tools.skills_hub as hub
+
+        hub_dir = tmp_path / "skills" / ".hub"
+        with patch.object(hub, "SKILLS_DIR", tmp_path / "skills"), \
+             patch.object(hub, "HUB_DIR", hub_dir), \
+             patch.object(hub, "LOCK_FILE", hub_dir / "lock.json"), \
+             patch.object(hub, "QUARANTINE_DIR", hub_dir / "quarantine"), \
+             patch.object(hub, "AUDIT_LOG", hub_dir / "audit.log"), \
+             patch.object(hub, "TAPS_FILE", hub_dir / "taps.json"), \
+             patch.object(hub, "INDEX_CACHE_DIR", hub_dir / "index-cache"):
+            bundle = SkillBundle(
+                name="demo",
+                files={
+                    "SKILL.md": "---\nname: demo\n---\n",
+                    "scripts/run.sh": "#!/usr/bin/env bash\necho hi\n",
+                    "scripts/helper.py": "print('hi')\n",
+                    "references/api.md": "# API\n",
+                },
+                source="github",
+                identifier="owner/repo/skills/demo",
+                trust_level="community",
+                executable_paths={"scripts/run.sh"},
+            )
+
+            q_path = quarantine_bundle(bundle)
+
+        run_sh = q_path / "scripts" / "run.sh"
+        helper_py = q_path / "scripts" / "helper.py"
+        skill_md = q_path / "SKILL.md"
+
+        assert run_sh.exists() and helper_py.exists() and skill_md.exists()
+        # Owner-exec bit set on the flagged file
+        assert os.access(run_sh, os.X_OK), "run.sh should be executable"
+        assert run_sh.stat().st_mode & stat.S_IXUSR
+        # Non-flagged files don't gain the exec bit
+        assert not (helper_py.stat().st_mode & stat.S_IXUSR), \
+            "helper.py was not in executable_paths and should not be exec"
+        assert not (skill_md.stat().st_mode & stat.S_IXUSR)
+
 
 # ---------------------------------------------------------------------------
 # GitHubSource._download_directory — tree API + fallback (#2940)
@@ -1560,15 +1610,20 @@ class TestDownloadDirectoryViaTree:
         mock_fetch.side_effect = lambda repo, path: f"content-of-{path}"
 
         src = self._source()
-        files = src._download_directory("owner/repo", "skills/my-skill")
+        files, executable_paths = src._download_directory("owner/repo", "skills/my-skill")
 
         assert "SKILL.md" in files
         assert "scripts/run.py" in files
         assert "references/api.md" in files
         assert "other/file.txt" not in files  # outside target path
         assert len(files) == 3
+        assert executable_paths == set()  # no 100755 entries in this fixture
 
-    @patch.object(GitHubSource, "_download_directory_recursive", return_value={"SKILL.md": "# ok"})
+    @patch.object(
+        GitHubSource,
+        "_download_directory_recursive",
+        return_value=({"SKILL.md": "# ok"}, set()),
+    )
     @patch("tools.skills_hub.httpx.get")
     def test_falls_back_on_truncated_tree(self, mock_get, mock_fallback):
         """When tree is truncated, fall back to recursive Contents API."""
@@ -1577,21 +1632,27 @@ class TestDownloadDirectoryViaTree:
         mock_get.side_effect = [repo_resp, tree_resp]
 
         src = self._source()
-        files = src._download_directory("owner/repo", "skills/my-skill")
+        files, executable_paths = src._download_directory("owner/repo", "skills/my-skill")
 
         assert files == {"SKILL.md": "# ok"}
+        assert executable_paths == set()
         mock_fallback.assert_called_once_with("owner/repo", "skills/my-skill")
 
-    @patch.object(GitHubSource, "_download_directory_recursive", return_value={"SKILL.md": "# ok"})
+    @patch.object(
+        GitHubSource,
+        "_download_directory_recursive",
+        return_value=({"SKILL.md": "# ok"}, set()),
+    )
     @patch("tools.skills_hub.httpx.get")
     def test_falls_back_on_repo_api_failure(self, mock_get, mock_fallback):
         """When the repo endpoint returns non-200, fall back to Contents API."""
         mock_get.return_value = MagicMock(status_code=404)
 
         src = self._source()
-        files = src._download_directory("owner/repo", "skills/my-skill")
+        files, executable_paths = src._download_directory("owner/repo", "skills/my-skill")
 
         assert files == {"SKILL.md": "# ok"}
+        assert executable_paths == set()
         mock_fallback.assert_called_once()
 
     @patch.object(GitHubSource, "_fetch_file_content")
@@ -1612,12 +1673,12 @@ class TestDownloadDirectoryViaTree:
         )
 
         src = self._source()
-        files = src._download_directory("owner/repo", "skills/my-skill")
+        files, _exec = src._download_directory("owner/repo", "skills/my-skill")
 
         assert "SKILL.md" in files
         assert "scripts/run.py" not in files
 
-    @patch.object(GitHubSource, "_download_directory_recursive", return_value={})
+    @patch.object(GitHubSource, "_download_directory_recursive", return_value=({}, set()))
     @patch("tools.skills_hub.httpx.get")
     def test_falls_back_on_network_error(self, mock_get, mock_fallback):
         """Network errors in tree API trigger fallback."""
@@ -1627,6 +1688,40 @@ class TestDownloadDirectoryViaTree:
         src._download_directory("owner/repo", "skills/my-skill")
 
         mock_fallback.assert_called_once()
+
+    @patch.object(GitHubSource, "_fetch_file_content")
+    @patch("tools.skills_hub.httpx.get")
+    def test_tree_api_preserves_exec_bit(self, mock_get, mock_fetch):
+        """Files with git mode 100755 are reported as executable.
+
+        This is the regression guard for the ``get-token.sh`` exec-bit
+        loss: any blob whose tree entry mode is ``100755`` must end up
+        in ``executable_paths`` so the install pipeline can chmod 0o755
+        when materialising the bundle on disk.  Files with mode 100644
+        must not be flagged.
+        """
+        repo_resp = MagicMock(status_code=200, json=lambda: {"default_branch": "main"})
+        tree_resp = MagicMock(status_code=200, json=lambda: {
+            "truncated": False,
+            "tree": [
+                # Regular file — exec bit not set
+                {"type": "blob", "mode": "100644", "path": "skills/my-skill/SKILL.md"},
+                # Script — exec bit set in git
+                {"type": "blob", "mode": "100755", "path": "skills/my-skill/scripts/run.sh"},
+                # Another regular file
+                {"type": "blob", "mode": "100644", "path": "skills/my-skill/references/api.md"},
+            ],
+        })
+        mock_get.side_effect = [repo_resp, tree_resp]
+        mock_fetch.side_effect = lambda repo, path: f"content-of-{path}"
+
+        src = self._source()
+        files, executable_paths = src._download_directory("owner/repo", "skills/my-skill")
+
+        assert "SKILL.md" in files
+        assert "scripts/run.sh" in files
+        assert "references/api.md" in files
+        assert executable_paths == {"scripts/run.sh"}
 
 
 class TestDownloadDirectoryRecursive:
@@ -1652,7 +1747,7 @@ class TestDownloadDirectoryRecursive:
         mock_fetch.side_effect = lambda repo, path: f"content-of-{path}"
 
         src = self._source()
-        files = src._download_directory_recursive("owner/repo", "skill")
+        files, _exec = src._download_directory_recursive("owner/repo", "skill")
 
         assert "SKILL.md" in files
         assert "scripts/run.py" in files
@@ -1670,7 +1765,7 @@ class TestDownloadDirectoryRecursive:
         mock_fetch.return_value = "content"
 
         src = self._source()
-        files = src._download_directory_recursive("owner/repo", "skill")
+        files, _exec = src._download_directory_recursive("owner/repo", "skill")
 
         assert "SKILL.md" in files
         assert "scripts/run.py" not in files  # lost due to rate limit
