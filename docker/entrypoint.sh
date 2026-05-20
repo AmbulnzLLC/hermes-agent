@@ -137,6 +137,27 @@ if [ -f "$INSTALL_DIR/docker/seed_taps.py" ]; then
         echo "Warning: seed_taps.py exited non-zero — continuing"
 fi
 
+# Seed admin-managed skill installs from HERMES_DEFAULT_SKILLS, if provided.
+# Pairs with seed_taps.py: that registers the private repo, this installs
+# specific skills from it (and any other source `hermes skills install`
+# accepts — well-known indexes, direct SKILL.md URLs, etc.) so the
+# AmbulnzLLC pilot's required skills are present on every pod immediately
+# after boot, instead of the operator running `hermes skills install` for
+# each one post-deploy.  Format is comma- or newline-separated identifiers
+# (e.g. `AmbulnzLLC/hermes-shared-skills/skills/data-engineering/airflow-dag`)
+# with an optional `@<name>` suffix for URL-sourced skills whose SKILL.md
+# lacks a `name:` frontmatter field.  This is a SEED, not a lock — the
+# hermes user can `hermes skills uninstall <name>` afterwards but the
+# skill will be re-installed on the next boot.  Idempotent: skills already
+# in lock.json are skipped.  Non-fatal: a single skill failing emits a
+# warning but boot continues; bad private-skill repos must NOT crash-loop
+# the pod and take chat down with it.  Silent no-op when the env var is
+# unset (generic deploys).  See docker/seed_skills.py for details.
+if [ -f "$INSTALL_DIR/docker/seed_skills.py" ]; then
+    python3 "$INSTALL_DIR/docker/seed_skills.py" || \
+        echo "Warning: seed_skills.py exited non-zero — continuing"
+fi
+
 # SOUL.md is provisioned in the root section above (root-owned, 0444), not here,
 # so the hermes user cannot rewrite it.
 
