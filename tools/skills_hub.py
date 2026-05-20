@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from hermes_constants import get_hermes_home
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 from urllib.parse import urljoin, urlparse, urlunparse
 
 import httpx
@@ -88,6 +88,14 @@ class SkillBundle:
     identifier: str
     trust_level: str
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # Relative paths that should be marked executable (chmod 0o755) when
+    # written to disk.  Sources that have access to the original file mode
+    # (e.g. GitHubSource via the git tree's "100755" entries) populate this
+    # so that scripts under skills (e.g. <skill>/scripts/*.sh) keep their
+    # exec bit through the quarantine -> install flow.  Empty by default
+    # (and ignored by sources that can't observe modes) to preserve the
+    # historical behaviour for callers that don't care.
+    executable_paths: Set[str] = field(default_factory=set)
 
 
 def _normalize_bundle_path(path_value: str, *, field_name: str, allow_nested: bool) -> str:
@@ -403,7 +411,7 @@ class GitHubSource(SkillSource):
         repo = f"{parts[0]}/{parts[1]}"
         skill_path = parts[2]
 
-        files = self._download_directory(repo, skill_path)
+        files, executable_paths = self._download_directory(repo, skill_path)
         if not files or "SKILL.md" not in files:
             return None
 
@@ -416,6 +424,7 @@ class GitHubSource(SkillSource):
             source="github",
             identifier=identifier,
             trust_level=trust,
+            executable_paths=executable_paths,
         )
 
     def inspect(self, identifier: str) -> Optional[SkillMeta]:
@@ -560,28 +569,40 @@ class GitHubSource(SkillSource):
                     "Set GITHUB_TOKEN or install the gh CLI to raise the limit to 5,000/hr."
                 )
 
-    def _download_directory(self, repo: str, path: str) -> Dict[str, str]:
+    def _download_directory(self, repo: str, path: str) -> Tuple[Dict[str, str], Set[str]]:
         """Recursively download all text files from a GitHub directory.
 
         Uses the Git Trees API first (single call for the entire tree) to
         avoid per-directory rate limiting that causes silent subdirectory
         loss.  Falls back to the recursive Contents API when the tree
         endpoint is unavailable or the response is truncated.
+
+        Returns ``(files, executable_paths)``.  ``executable_paths`` lists
+        relative paths whose git tree mode is ``100755`` (or, for the
+        Contents API fallback that lacks mode metadata, paths whose first
+        bytes form a ``#!`` shebang) so callers can re-apply the exec bit
+        when materialising the bundle on disk.
         """
-        files = self._download_directory_via_tree(repo, path)
-        if files is not None:
-            return files
+        result = self._download_directory_via_tree(repo, path)
+        if result is not None:
+            return result
         logger.debug("Tree API unavailable for %s/%s, falling back to Contents API", repo, path)
         return self._download_directory_recursive(repo, path)
 
-    def _download_directory_via_tree(self, repo: str, path: str) -> Optional[Dict[str, str]]:
+    def _download_directory_via_tree(self, repo: str, path: str) -> Optional[Tuple[Dict[str, str], Set[str]]]:
         """Download an entire directory using the Git Trees API (single request).
 
         Returns:
-            dict of files if the path exists and has content,
-            empty dict ``{}`` if the tree is cached but the path doesn't exist
+            ``(files, executable_paths)`` if the path exists and has content,
+            ``({}, set())`` if the tree is cached but the path doesn't exist
             (prevents unnecessary Contents API fallback),
             ``None`` if the tree couldn't be fetched (triggers Contents API fallback).
+
+        ``executable_paths`` is the subset of ``files.keys()`` whose git
+        tree mode is ``100755`` — i.e. files committed with the exec bit
+        set.  This lets the install pipeline preserve the exec bit on
+        scripts (``<skill>/scripts/*.sh`` etc.) instead of silently
+        dropping it as ``write_text``'s default 0o644.
         """
         path = path.rstrip("/")
 
@@ -598,10 +619,11 @@ class GitHubSource(SkillSource):
         if not has_entries:
             # Path definitively doesn't exist in the repo — return empty
             # instead of None to skip the Contents API fallback.
-            return {}
+            return {}, set()
 
         # Filter to blobs under our target path and fetch content
         files: Dict[str, str] = {}
+        executable_paths: Set[str] = set()
         for item in tree_entries:
             if item.get("type") != "blob":
                 continue
@@ -612,27 +634,44 @@ class GitHubSource(SkillSource):
             content = self._fetch_file_content(repo, item_path)
             if content is not None:
                 files[rel_path] = content
+                # Git mode "100755" = regular file with exec bit set.
+                # "100644" = regular file (no exec bit).  We preserve the
+                # former so scripts shipped in skills stay runnable after
+                # install.
+                if item.get("mode") == "100755":
+                    executable_paths.add(rel_path)
             else:
                 logger.debug("Skipped file (fetch failed): %s/%s", repo, item_path)
 
-        return files if files else None
+        if not files:
+            return None
+        return files, executable_paths
 
-    def _download_directory_recursive(self, repo: str, path: str) -> Dict[str, str]:
-        """Recursively download via Contents API (fallback)."""
+    def _download_directory_recursive(self, repo: str, path: str) -> Tuple[Dict[str, str], Set[str]]:
+        """Recursively download via Contents API (fallback).
+
+        The Contents API doesn't expose git mode, so executable paths are
+        inferred from a ``#!`` shebang in the file content.  This is a
+        best-effort fallback for the rare case where the Trees API isn't
+        reachable; the primary path (``_download_directory_via_tree``)
+        uses the authoritative git mode.
+        """
         url = f"https://api.github.com/repos/{repo}/contents/{path.rstrip('/')}"
         try:
             resp = httpx.get(url, headers=self.auth.get_headers(), timeout=15, follow_redirects=True)
             if resp.status_code != 200:
                 logger.debug("Contents API returned %d for %s/%s", resp.status_code, repo, path)
-                return {}
+                return {}, set()
         except httpx.HTTPError:
-            return {}
+            return {}, set()
 
         entries = resp.json()
+
         if not isinstance(entries, list):
-            return {}
+            return {}, set()
 
         files: Dict[str, str] = {}
+        executable_paths: Set[str] = set()
         for entry in entries:
             name = entry.get("name", "")
             entry_type = entry.get("type", "")
@@ -642,15 +681,19 @@ class GitHubSource(SkillSource):
                 if content is not None:
                     rel_path = name
                     files[rel_path] = content
+                    if isinstance(content, str) and content.startswith("#!"):
+                        executable_paths.add(rel_path)
             elif entry_type == "dir":
-                sub_files = self._download_directory_recursive(repo, entry.get("path", ""))
+                sub_files, sub_exec = self._download_directory_recursive(repo, entry.get("path", ""))
                 if not sub_files:
                     logger.debug("Empty or failed subdirectory: %s/%s", repo, entry.get("path", ""))
                 for sub_name, sub_content in sub_files.items():
-                    files[f"{name}/{sub_name}"] = sub_content
+                    rel_path = f"{name}/{sub_name}"
+                    files[rel_path] = sub_content
+                for sub_rel in sub_exec:
+                    executable_paths.add(f"{name}/{sub_rel}")
 
-        return files
-
+        return files, executable_paths
     def _find_skill_in_repo_tree(self, repo: str, skill_name: str) -> Optional[str]:
         """Use the GitHub Trees API to find a skill directory anywhere in the repo.
 
@@ -2732,6 +2775,13 @@ def quarantine_bundle(bundle: SkillBundle) -> Path:
         safe_rel_path = _validate_bundle_rel_path(rel_path)
         validated_files.append((safe_rel_path, file_content))
 
+    # Re-validate executable_paths against the same allow-list used for the
+    # file map so a malicious source can't smuggle a chmod for a path that
+    # never made it through path validation (or escaped via traversal).
+    safe_executable_paths: Set[str] = set()
+    for rel_path in bundle.executable_paths:
+        safe_executable_paths.add(_validate_bundle_rel_path(rel_path))
+
     dest = QUARANTINE_DIR / skill_name
     if dest.exists():
         shutil.rmtree(dest)
@@ -2744,6 +2794,23 @@ def quarantine_bundle(bundle: SkillBundle) -> Path:
             file_dest.write_bytes(file_content)
         else:
             file_dest.write_text(file_content, encoding="utf-8")
+        # Re-apply the exec bit observed at the source (e.g. git mode
+        # 100755) so scripts shipped in skills stay runnable through the
+        # quarantine -> install_from_quarantine flow.  Without this,
+        # write_text/write_bytes default to 0o644 and downstream callers
+        # like ``$("$SKILL_DIR/scripts/get-token.sh")`` fail with
+        # "Permission denied".  ``install_from_quarantine`` uses
+        # ``shutil.move``, which preserves mode, so chmod here is enough.
+        if rel_path in safe_executable_paths:
+            try:
+                file_dest.chmod(0o755)
+            except OSError as exc:
+                # Non-fatal: chmod can fail on exotic filesystems (e.g.
+                # certain network mounts); the file still installs, just
+                # without the exec bit.  Log so operators can diagnose.
+                logger.warning(
+                    "Failed to set exec bit on %s: %s", file_dest, exc
+                )
 
     return dest
 
