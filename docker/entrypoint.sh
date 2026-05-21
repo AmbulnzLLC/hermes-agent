@@ -67,6 +67,24 @@ if [ "$(id -u)" = "0" ]; then
         chmod 0444 "$HERMES_HOME/SOUL.md" 2>/dev/null || true
     fi
 
+    # GitHub App PEM — admin-managed credential for outbound git/GitHub API
+    # auth (skills-hub private taps, gh CLI, raw `git clone`).  When
+    # GITHUB_APP_PEM_SECRET_ID is set, fetch the PEM from AWS Secrets
+    # Manager and drop it at GITHUB_APP_PEM_DEST_PATH (default
+    # /opt/data/secrets/github-app.pem) as hermes:hermes mode 0400.  Once
+    # in place, Hermes's built-in GitHubAuth._try_github_app() picks it up
+    # via GITHUB_APP_ID / GITHUB_APP_INSTALLATION_ID / GITHUB_APP_PRIVATE_KEY_PATH
+    # and mints installation tokens automatically.  Silent no-op when the
+    # secret-id env var is unset (generic deploys).  Crashes the boot on
+    # any error when set — a misconfigured pilot pod must crash-loop, not
+    # serve traffic without working GitHub auth.  Must run while still
+    # root (before the gosu drop) so the chown/chmod take effect.  Uses
+    # the venv's python because boto3 lives in the bedrock extra and the
+    # venv is not yet activated at this point.
+    if [ -f "$INSTALL_DIR/docker/install_github_app_pem.py" ]; then
+        "$INSTALL_DIR/.venv/bin/python3" "$INSTALL_DIR/docker/install_github_app_pem.py"
+    fi
+
     echo "Dropping root privileges"
     exec gosu hermes "$0" "$@"
 fi
@@ -105,6 +123,42 @@ fi
 if [ -f "$INSTALL_DIR/docker/seed_admin_config.py" ]; then
     python3 "$INSTALL_DIR/docker/seed_admin_config.py" || \
         echo "Warning: seed_admin_config.py exited non-zero — continuing"
+fi
+
+# Seed admin-managed skills-hub taps from HERMES_DEFAULT_TAPS, if provided.
+# Pairs with install_github_app_pem.py (the PEM provides outbound auth;
+# this registers the private repo(s) that use it) so the AmbulnzLLC pilot
+# (and any deployment shipping private skill repos) gets its shared
+# skills tap auto-registered without a post-deploy `hermes skills tap add`.
+# Format is comma- or newline-separated "owner/repo[@path]" or full URL.
+# This is a SEED, not a lock — the hermes user can `hermes skills tap
+# remove` afterwards; entries will be re-seeded on the next boot.
+# Idempotent: skips entries already in taps.json.  Silent no-op when the
+# env var is unset (generic deploys).  See docker/seed_taps.py for details.
+if [ -f "$INSTALL_DIR/docker/seed_taps.py" ]; then
+    python3 "$INSTALL_DIR/docker/seed_taps.py" || \
+        echo "Warning: seed_taps.py exited non-zero — continuing"
+fi
+
+# Seed admin-managed skill installs from HERMES_DEFAULT_SKILLS, if provided.
+# Pairs with seed_taps.py: that registers the private repo, this installs
+# specific skills from it (and any other source `hermes skills install`
+# accepts — well-known indexes, direct SKILL.md URLs, etc.) so the
+# AmbulnzLLC pilot's required skills are present on every pod immediately
+# after boot, instead of the operator running `hermes skills install` for
+# each one post-deploy.  Format is comma- or newline-separated identifiers
+# (e.g. `AmbulnzLLC/hermes-shared-skills/skills/data-engineering/airflow-dag`)
+# with an optional `@<name>` suffix for URL-sourced skills whose SKILL.md
+# lacks a `name:` frontmatter field.  This is a SEED, not a lock — the
+# hermes user can `hermes skills uninstall <name>` afterwards but the
+# skill will be re-installed on the next boot.  Idempotent: skills already
+# in lock.json are skipped.  Non-fatal: a single skill failing emits a
+# warning but boot continues; bad private-skill repos must NOT crash-loop
+# the pod and take chat down with it.  Silent no-op when the env var is
+# unset (generic deploys).  See docker/seed_skills.py for details.
+if [ -f "$INSTALL_DIR/docker/seed_skills.py" ]; then
+    python3 "$INSTALL_DIR/docker/seed_skills.py" || \
+        echo "Warning: seed_skills.py exited non-zero — continuing"
 fi
 
 # SOUL.md is provisioned in the root section above (root-owned, 0444), not here,
