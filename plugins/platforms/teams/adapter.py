@@ -1628,6 +1628,95 @@ class TeamsAdapter(BasePlatformAdapter):
             logger.error("[teams] send_exec_approval failed: %s", e, exc_info=True)
             return SendResult(success=False, error=str(e), retryable=True)
 
+    async def send_clarify(
+        self,
+        chat_id: str,
+        question: str,
+        choices: Optional[list],
+        clarify_id: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Render a clarify prompt as an Adaptive Card with one button per choice.
+
+        Multiple-choice mode (``choices`` non-empty): renders the question as a
+        TextBlock and each choice as an ``ExecuteAction`` with verb
+        ``hermes_clarify``. Appends a final "Other (type your answer)" action
+        that flips the clarify primitive into text-capture mode on click.
+
+        Open-ended mode (``choices`` is None or empty): falls back to a plain
+        text message + ``mark_awaiting_text`` so the gateway's text-intercept
+        resolves the next user message.
+        """
+        if not self._app:
+            return SendResult(success=False, error="Teams app not initialized")
+
+        # Open-ended path
+        if not choices:
+            return await self._send_clarify_text(
+                chat_id=chat_id,
+                question=question,
+                clarify_id=clarify_id,
+                metadata=metadata,
+            )
+
+        # Defensive cap — clarify_tool should already truncate to MAX_CHOICES=4,
+        # but never trust upstream invariants in a render path.
+        MAX_BUTTONS = 4
+        bounded = list(choices)[:MAX_BUTTONS]
+
+        actions = []
+        for idx, choice in enumerate(bounded):
+            actions.append(
+                ExecuteAction(
+                    title=str(choice)[:80],  # Teams card button label cap
+                    verb="hermes_clarify",
+                    data={
+                        "clarify_id": clarify_id,
+                        "session_key": session_key,
+                        "choice_idx": idx,
+                        "choice_text": str(choice)[:200],  # truncate for payload
+                    },
+                )
+            )
+        # Always offer a free-text escape hatch
+        actions.append(
+            ExecuteAction(
+                title="Other (type your answer)",
+                verb="hermes_clarify",
+                data={
+                    "clarify_id": clarify_id,
+                    "session_key": session_key,
+                    "choice_idx": "other",
+                },
+            )
+        )
+
+        body = [TextBlock(text=f"❓ {question}", wrap=True, weight="Bolder")]
+        if len(choices) > MAX_BUTTONS:
+            body.append(
+                TextBlock(
+                    text=f"(showing first {MAX_BUTTONS} of {len(choices)} options)",
+                    wrap=True,
+                    isSubtle=True,
+                )
+            )
+
+        card = (
+            AdaptiveCard()
+            .with_version("1.4")
+            .with_body(body)
+            .with_actions(actions)
+        )
+
+        try:
+            result = await self._send_card(chat_id, card)
+            message_id = getattr(result, "id", None) if result else None
+            return SendResult(success=True, message_id=message_id)
+        except Exception as e:
+            logger.error("[teams] send_clarify failed: %s", e, exc_info=True)
+            return SendResult(success=False, error=str(e), retryable=True)
+
     async def send(
         self,
         chat_id: str,

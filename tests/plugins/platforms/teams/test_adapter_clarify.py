@@ -124,3 +124,100 @@ class TestVerbRouting:
         with patch("tools.approval.has_blocking_approval", return_value=False):
             await adapter._on_card_action(ctx)
         clarify_mock.assert_not_called()
+
+
+def _action_data(action) -> dict:
+    """Return the action's data payload as a plain dict.
+
+    The Teams SDK wraps action ``data`` in a Pydantic ``SubmitActionData``
+    model that isn't subscriptable, so tests can't index it directly.
+    """
+    d = action.data
+    if hasattr(d, "model_dump"):
+        return d.model_dump()
+    if isinstance(d, dict):
+        return d
+    return dict(d)
+
+
+class TestSendClarifyChoices:
+    """send_clarify with a non-empty choices list renders an Adaptive Card."""
+
+    @pytest.mark.asyncio
+    async def test_renders_card_with_button_per_choice_plus_other(self):
+        adapter = _make_adapter()
+        captured = {}
+        async def fake_send_card(chat_id, card):
+            captured["chat_id"] = chat_id
+            captured["card"] = card
+            return SimpleNamespace(id="msg-123")
+        adapter._send_card = fake_send_card
+
+        result = await adapter.send_clarify(
+            chat_id="conv1",
+            question="Which approach?",
+            choices=["Option A", "Option B", "Option C"],
+            clarify_id="cid01",
+            session_key="sess1",
+        )
+
+        assert result.success is True
+        assert result.message_id == "msg-123"
+        card = captured["card"]
+        # 3 choice buttons + 1 "Other" button = 4 actions
+        actions = card.actions if hasattr(card, "actions") else card._actions
+        assert len(actions) == 4
+        # Each non-Other button has hermes_clarify verb
+        for i in range(3):
+            assert actions[i].verb == "hermes_clarify"
+            data_i = _action_data(actions[i])
+            assert data_i["clarify_id"] == "cid01"
+            assert data_i["choice_idx"] == i
+        # "Other" button is last, with sentinel index
+        assert actions[3].verb == "hermes_clarify"
+        assert _action_data(actions[3])["choice_idx"] == "other"
+
+    @pytest.mark.asyncio
+    async def test_truncates_long_choice_in_button_data(self):
+        adapter = _make_adapter()
+        captured = {}
+        async def fake_send_card(chat_id, card):
+            captured["card"] = card
+            return SimpleNamespace(id="msg-1")
+        adapter._send_card = fake_send_card
+
+        long_choice = "x" * 500
+        await adapter.send_clarify(
+            chat_id="c1",
+            question="Q?",
+            choices=[long_choice],
+            clarify_id="cid02",
+            session_key="s",
+        )
+
+        card = captured["card"]
+        actions = card.actions if hasattr(card, "actions") else card._actions
+        # Truncated for payload — full text only in card body
+        assert len(_action_data(actions[0])["choice_text"]) <= 200
+
+    @pytest.mark.asyncio
+    async def test_caps_choices_at_max(self):
+        """clarify_tool itself caps at MAX_CHOICES=4, but the adapter must not crash if upstream sends more."""
+        adapter = _make_adapter()
+        captured = {}
+        async def fake_send_card(chat_id, card):
+            captured["card"] = card
+            return SimpleNamespace(id="m")
+        adapter._send_card = fake_send_card
+
+        await adapter.send_clarify(
+            chat_id="c1",
+            question="Q?",
+            choices=["A", "B", "C", "D", "E", "F"],  # 6 choices
+            clarify_id="cid03",
+            session_key="s",
+        )
+        card = captured["card"]
+        actions = card.actions if hasattr(card, "actions") else card._actions
+        # 4 choice buttons (capped) + 1 "Other" = 5 actions max
+        assert len(actions) <= 5
