@@ -663,7 +663,7 @@ def normalize_converse_response(response: Dict) -> SimpleNamespace:
                 type="function",
                 function=SimpleNamespace(
                     name=tu.get("name", ""),
-                    arguments=json.dumps(tu.get("input", {})),
+                    arguments=json.dumps(tu.get("input", {}), ensure_ascii=False),
                 ),
             ))
 
@@ -815,7 +815,7 @@ def stream_converse_with_callbacks(
                     type="function",
                     function=SimpleNamespace(
                         name=current_tool["name"],
-                        arguments=json.dumps(input_dict),
+                        arguments=json.dumps(input_dict, ensure_ascii=False),
                     ),
                 ))
                 current_tool = None

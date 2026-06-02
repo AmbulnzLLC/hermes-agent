@@ -1039,7 +1039,7 @@ def run_conversation(
                             **tc["function"],
                             "arguments": json.dumps(
                                 args_obj, separators=(",", ":"),
-                                sort_keys=True,
+                                sort_keys=True, ensure_ascii=False,
                             ),
                         }}
                     except Exception:
@@ -3643,7 +3643,7 @@ def run_conversation(
                 for tc in assistant_message.tool_calls:
                     args = tc.function.arguments
                     if isinstance(args, (dict, list)):
-                        tc.function.arguments = json.dumps(args)
+                        tc.function.arguments = json.dumps(args, ensure_ascii=False)
                         continue
                     if args is not None and not isinstance(args, str):
                         tc.function.arguments = str(args)
