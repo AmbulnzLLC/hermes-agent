@@ -1444,6 +1444,39 @@ class TeamsAdapter(BasePlatformAdapter):
             return await self._app.send(chat_id, card)
         return None
 
+    def _authorize_card_clicker(
+        self, ctx: "ActivityContext[AdaptiveCardInvokeActivity]"
+    ) -> tuple[bool, str]:
+        """Check whether the user who clicked an Adaptive Card button is authorized.
+
+        Returns ``(allowed, reason_if_denied)``. ``reason_if_denied`` is a short
+        user-facing string suitable for an ``AdaptiveCardActionMessageResponse``.
+
+        Default-deny: requires either ``TEAMS_ALLOWED_USERS`` (CSV of AAD object IDs,
+        or ``*`` wildcard) or ``TEAMS_ALLOW_ALL_USERS=true`` to be set. This matches
+        the security posture of the original inlined check in ``_on_card_action``.
+        """
+        allowed_csv = os.getenv("TEAMS_ALLOWED_USERS", "").strip()
+        allow_all = os.getenv("TEAMS_ALLOW_ALL_USERS", "").strip().lower() in {"1", "true", "yes"}
+
+        if allow_all:
+            return (True, "")
+
+        if not allowed_csv:
+            logger.warning(
+                "[teams] card action rejected: TEAMS_ALLOWED_USERS not configured "
+                "and TEAMS_ALLOW_ALL_USERS not set — default deny"
+            )
+            return (False, "⛔ Card buttons require TEAMS_ALLOWED_USERS to be configured.")
+
+        from_account = ctx.activity.from_
+        clicker_id = getattr(from_account, "aad_object_id", None) or getattr(from_account, "id", "")
+        allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
+        if "*" not in allowed_ids and clicker_id not in allowed_ids:
+            logger.warning("[teams] Unauthorized card action by %s — ignoring", clicker_id)
+            return (False, "⛔ Not authorized.")
+        return (True, "")
+
     async def _on_card_action(
         self, ctx: "ActivityContext[AdaptiveCardInvokeActivity]"
     ) -> "InvokeResponse[AdaptiveCardActionMessageResponse]":
@@ -1452,6 +1485,9 @@ class TeamsAdapter(BasePlatformAdapter):
 
         action = ctx.activity.value.action
         data = action.data or {}
+        verb = getattr(action, "verb", "") or ""
+        if verb == "hermes_clarify":
+            return await self._on_clarify_action(ctx)
         hermes_action = data.get("hermes_action", "")
         session_key = data.get("session_key", "")
 
@@ -1466,30 +1502,12 @@ class TeamsAdapter(BasePlatformAdapter):
         # TEAMS_ALLOW_ALL_USERS=true opt-in. Without one of these set, the
         # bot silently treated every clicker as authorized — meaning any
         # Teams user who could message the bot could approve dangerous commands.
-        allowed_csv = os.getenv("TEAMS_ALLOWED_USERS", "").strip()
-        allow_all = os.getenv("TEAMS_ALLOW_ALL_USERS", "").strip().lower() in {"1", "true", "yes"}
-
-        if not allow_all:
-            if not allowed_csv:
-                logger.warning(
-                    "[teams] card action rejected: TEAMS_ALLOWED_USERS not configured "
-                    "and TEAMS_ALLOW_ALL_USERS not set — default deny"
-                )
-                return InvokeResponse(
-                    status=200,
-                    body=AdaptiveCardActionMessageResponse(
-                        value="⛔ Approval buttons require TEAMS_ALLOWED_USERS to be configured."
-                    ),
-                )
-            from_account = ctx.activity.from_
-            clicker_id = getattr(from_account, "aad_object_id", None) or getattr(from_account, "id", "")
-            allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
-            if "*" not in allowed_ids and clicker_id not in allowed_ids:
-                logger.warning("[teams] Unauthorized card action by %s — ignoring", clicker_id)
-                return InvokeResponse(
-                    status=200,
-                    body=AdaptiveCardActionMessageResponse(value="⛔ Not authorized."),
-                )
+        ok, reason = self._authorize_card_clicker(ctx)
+        if not ok:
+            return InvokeResponse(
+                status=200,
+                body=AdaptiveCardActionMessageResponse(value=reason),
+            )
 
         choice_map = {
             "approve_once": "once",
@@ -1536,6 +1554,101 @@ class TeamsAdapter(BasePlatformAdapter):
             status=200,
             body=AdaptiveCardActionCardResponse(
                 value=AdaptiveCard().with_version("1.4").with_body(body)
+            ),
+        )
+
+    async def _on_clarify_action(
+        self, ctx: "ActivityContext[AdaptiveCardInvokeActivity]"
+    ) -> "InvokeResponse[AdaptiveCardActionMessageResponse]":
+        """Handle a clarify-card button click."""
+        from tools.clarify_gateway import (
+            resolve_gateway_clarify,
+            mark_awaiting_text,
+            _entries as _clarify_entries,  # type: ignore[attr-defined]
+        )
+
+        # 1. Authorize
+        ok, reason = self._authorize_card_clicker(ctx)
+        if not ok:
+            return InvokeResponse(
+                status=200,
+                body=AdaptiveCardActionMessageResponse(value=reason),
+            )
+
+        # 2. Extract payload
+        action = ctx.activity.value.action
+        data = action.data or {}
+        clarify_id = data.get("clarify_id", "")
+        choice_idx = data.get("choice_idx")
+        choice_text = data.get("choice_text", "")
+
+        if not clarify_id:
+            return InvokeResponse(
+                status=200,
+                body=AdaptiveCardActionMessageResponse(value="Unknown clarify action."),
+            )
+
+        # 3. Stale-card check — entry may have been resolved or timed out
+        entry = _clarify_entries.get(clarify_id)
+        if entry is None:
+            return InvokeResponse(
+                status=200,
+                body=AdaptiveCardActionCardResponse(
+                    value=AdaptiveCard()
+                    .with_version("1.4")
+                    .with_body([
+                        TextBlock(text="⚠️ Question already answered or expired.", wrap=True),
+                    ]),
+                ),
+            )
+
+        # 4. "Other" — flip to text-capture and tell the user
+        if choice_idx == "other":
+            mark_awaiting_text(clarify_id)
+            return InvokeResponse(
+                status=200,
+                body=AdaptiveCardActionCardResponse(
+                    value=AdaptiveCard()
+                    .with_version("1.4")
+                    .with_body([
+                        TextBlock(text=f"❓ {entry.question}", wrap=True, weight="Bolder"),
+                        TextBlock(
+                            text="✏️ Type your answer as your next message.",
+                            wrap=True,
+                            isSubtle=True,
+                        ),
+                    ]),
+                ),
+            )
+
+        # 5. Resolve to chosen text. Fall back to entry.choices[idx] if the truncated
+        #    payload text is missing (defensive — the data round-trip is short but
+        #    not guaranteed to preserve every char).
+        resolved_text = choice_text
+        if not resolved_text:
+            try:
+                resolved_text = entry.choices[int(choice_idx)]
+            except (ValueError, IndexError, AttributeError, TypeError):
+                resolved_text = str(choice_idx)
+
+        try:
+            resolve_gateway_clarify(clarify_id, resolved_text)
+        except Exception as exc:
+            logger.error("[teams] resolve_gateway_clarify failed for %s: %s", clarify_id, exc)
+            return InvokeResponse(
+                status=200,
+                body=AdaptiveCardActionMessageResponse(value="Failed to record your answer."),
+            )
+
+        return InvokeResponse(
+            status=200,
+            body=AdaptiveCardActionCardResponse(
+                value=AdaptiveCard()
+                .with_version("1.4")
+                .with_body([
+                    TextBlock(text=f"❓ {entry.question}", wrap=True, weight="Bolder"),
+                    TextBlock(text=f"✅ You picked: {resolved_text}", wrap=True),
+                ]),
             ),
         )
 
@@ -1600,6 +1713,115 @@ class TeamsAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.error("[teams] send_exec_approval failed: %s", e, exc_info=True)
             return SendResult(success=False, error=str(e), retryable=True)
+
+    async def send_clarify(
+        self,
+        chat_id: str,
+        question: str,
+        choices: Optional[list],
+        clarify_id: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Render a clarify prompt as an Adaptive Card with one button per choice.
+
+        Multiple-choice mode (``choices`` non-empty): renders the question as a
+        TextBlock and each choice as an ``ExecuteAction`` with verb
+        ``hermes_clarify``. Appends a final "Other (type your answer)" action
+        that flips the clarify primitive into text-capture mode on click.
+
+        Open-ended mode (``choices`` is None or empty): falls back to a plain
+        text message + ``mark_awaiting_text`` so the gateway's text-intercept
+        resolves the next user message.
+        """
+        if not self._app:
+            return SendResult(success=False, error="Teams app not initialized")
+
+        # Open-ended path
+        if not choices:
+            return await self._send_clarify_text(
+                chat_id=chat_id,
+                question=question,
+                clarify_id=clarify_id,
+                metadata=metadata,
+            )
+
+        # Defensive cap — clarify_tool should already truncate to MAX_CHOICES=4,
+        # but never trust upstream invariants in a render path.
+        MAX_BUTTONS = 4
+        bounded = list(choices)[:MAX_BUTTONS]
+
+        actions = []
+        for idx, choice in enumerate(bounded):
+            actions.append(
+                ExecuteAction(
+                    title=str(choice)[:80],  # Teams card button label cap
+                    verb="hermes_clarify",
+                    data={
+                        "clarify_id": clarify_id,
+                        "session_key": session_key,
+                        "choice_idx": idx,
+                        "choice_text": str(choice)[:200],  # truncate for payload
+                    },
+                )
+            )
+        # Always offer a free-text escape hatch
+        actions.append(
+            ExecuteAction(
+                title="Other (type your answer)",
+                verb="hermes_clarify",
+                data={
+                    "clarify_id": clarify_id,
+                    "session_key": session_key,
+                    "choice_idx": "other",
+                },
+            )
+        )
+
+        body = [TextBlock(text=f"❓ {question}", wrap=True, weight="Bolder")]
+        if len(choices) > MAX_BUTTONS:
+            body.append(
+                TextBlock(
+                    text=f"(showing first {MAX_BUTTONS} of {len(choices)} options)",
+                    wrap=True,
+                    isSubtle=True,
+                )
+            )
+
+        card = (
+            AdaptiveCard()
+            .with_version("1.4")
+            .with_body(body)
+            .with_actions(actions)
+        )
+
+        try:
+            result = await self._send_card(chat_id, card)
+            message_id = getattr(result, "id", None) if result else None
+            return SendResult(success=True, message_id=message_id)
+        except Exception as e:
+            logger.error("[teams] send_clarify failed: %s", e, exc_info=True)
+            return SendResult(success=False, error=str(e), retryable=True)
+
+    async def _send_clarify_text(
+        self,
+        chat_id: str,
+        question: str,
+        clarify_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Open-ended clarify: send plain text + flip into text-capture mode.
+
+        The gateway's text-intercept watches for the next user message in this
+        chat and resolves the clarify primitive with whatever the user types.
+        """
+        from tools.clarify_gateway import mark_awaiting_text
+        mark_awaiting_text(clarify_id)
+        return await self.send(
+            chat_id=chat_id,
+            content=f"❓ {question}",
+            metadata=metadata,
+        )
 
     async def send(
         self,
