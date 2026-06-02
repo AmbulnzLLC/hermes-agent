@@ -330,3 +330,34 @@ class TestOnClarifyActionChoice:
         resolve_mock.assert_not_called()
         # Body should be a card with an "expired" message
         assert response.status == 200
+
+
+class TestOnClarifyActionOther:
+    """The 'Other' button must NOT resolve the clarify; it flips to text-capture."""
+
+    @pytest.mark.asyncio
+    async def test_other_click_calls_mark_awaiting_not_resolve(self, monkeypatch):
+        monkeypatch.setenv("TEAMS_ALLOW_ALL_USERS", "true")
+        adapter = _make_adapter()
+
+        action = SimpleNamespace(
+            verb="hermes_clarify",
+            data={"clarify_id": "cid_other", "session_key": "s", "choice_idx": "other"},
+        )
+        ctx = SimpleNamespace(
+            activity=SimpleNamespace(
+                value=SimpleNamespace(action=action),
+                from_=SimpleNamespace(aad_object_id="u1", id="u1"),
+            )
+        )
+
+        with patch("tools.clarify_gateway._entries",
+                   {"cid_other": SimpleNamespace(question="Q?", choices=["A", "B"])},
+                   create=True), \
+             patch("tools.clarify_gateway.resolve_gateway_clarify") as resolve_mock, \
+             patch("tools.clarify_gateway.mark_awaiting_text") as mark_mock:
+            response = await adapter._on_clarify_action(ctx)
+
+        resolve_mock.assert_not_called()
+        mark_mock.assert_called_once_with("cid_other")
+        assert response.status == 200
