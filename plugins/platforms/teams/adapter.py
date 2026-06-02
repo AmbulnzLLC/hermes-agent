@@ -443,7 +443,13 @@ def check_requirements() -> bool:
             HttpResponse as _HttpResponse,
             HttpRouteHandler as _HttpRouteHandler,
         )
-        from microsoft_teams.cards import AdaptiveCard as _AdaptiveCard, ExecuteAction as _ExecuteAction, TextBlock as _TextBlock
+        from microsoft_teams.cards import (
+            AdaptiveCard as _AdaptiveCard,
+            Choice as _Choice,
+            ChoiceSetInput as _ChoiceSetInput,
+            ExecuteAction as _ExecuteAction,
+            TextBlock as _TextBlock,
+        )
     except ImportError:
         return False
     web = _web
@@ -459,6 +465,7 @@ def check_requirements() -> bool:
     HttpMethod, HttpRequest = _HttpMethod, _HttpRequest
     HttpResponse, HttpRouteHandler = _HttpResponse, _HttpRouteHandler
     AdaptiveCard, ExecuteAction, TextBlock = _AdaptiveCard, _ExecuteAction, _TextBlock
+    Choice, ChoiceSetInput = _Choice, _ChoiceSetInput
     AIOHTTP_AVAILABLE = True
     TEAMS_SDK_AVAILABLE = True
     return True

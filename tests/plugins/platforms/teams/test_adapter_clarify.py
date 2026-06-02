@@ -8,6 +8,7 @@ from unittest.mock import patch, MagicMock
 import pytest
 
 from plugins.platforms.teams.adapter import TeamsAdapter
+from plugins.platforms.teams import adapter as teams_adapter_module
 
 
 def _make_adapter() -> TeamsAdapter:
@@ -597,3 +598,38 @@ class TestClarifyEdgeCases:
              patch("tools.clarify_gateway.resolve_gateway_clarify", return_value=True) as resolve_mock:
             await adapter._on_clarify_action(ctx)
         resolve_mock.assert_called_once_with("cid", "B")
+
+
+class TestLateImportBindings:
+    """The Teams adapter has TWO import paths for microsoft_teams.cards symbols:
+
+    1. Top-level ``try/except ImportError`` at module load time.
+    2. ``check_requirements()`` re-imports + re-binds the names when the
+       lazy-deps installer pulls them in for deferred init.
+
+    Whatever ``send_clarify`` references at runtime MUST be bound to the module
+    namespace by BOTH paths. The deployed pod hit ``NameError: ChoiceSetInput
+    is not defined`` because the late-init path only re-bound a subset of the
+    symbols. This test guards against the same omission for any future symbol.
+    """
+
+    def test_late_init_binds_all_card_symbols_used_by_send_clarify(self):
+        # If the deferred init succeeds in this test environment, all the
+        # symbols send_clarify dereferences must be bound to module globals.
+        result = teams_adapter_module.check_requirements()
+        if not result:
+            pytest.skip("microsoft_teams SDK not available in this env")
+
+        required = (
+            "AdaptiveCard",
+            "ExecuteAction",
+            "TextBlock",
+            "Choice",
+            "ChoiceSetInput",
+        )
+        missing = [n for n in required if getattr(teams_adapter_module, n, None) is None]
+        assert not missing, (
+            f"check_requirements() failed to bind: {missing}. "
+            "Add the import to the deferred-init block AND the assignment line "
+            "(see plugins/platforms/teams/adapter.py around lines 446 and 461)."
+        )
