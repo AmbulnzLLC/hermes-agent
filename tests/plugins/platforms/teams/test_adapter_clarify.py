@@ -266,3 +266,67 @@ class TestSendClarifyOpenEnded:
                 session_key="s1",
             )
         mark_mock.assert_called_once_with("cid_empty")
+
+
+class TestOnClarifyActionChoice:
+    """Clicking a choice button resolves the clarify and returns a confirmation card."""
+
+    def _make_click_ctx(self, clarify_id: str, choice_idx, choice_text="Option A"):
+        action = SimpleNamespace(
+            verb="hermes_clarify",
+            data={
+                "clarify_id": clarify_id,
+                "session_key": "s1",
+                "choice_idx": choice_idx,
+                "choice_text": choice_text,
+            },
+        )
+        return SimpleNamespace(
+            activity=SimpleNamespace(
+                value=SimpleNamespace(action=action),
+                from_=SimpleNamespace(aad_object_id="u1", id="u1"),
+            )
+        )
+
+    @pytest.mark.asyncio
+    async def test_choice_click_resolves_with_choice_text(self, monkeypatch):
+        monkeypatch.setenv("TEAMS_ALLOW_ALL_USERS", "true")
+        adapter = _make_adapter()
+
+        ctx = self._make_click_ctx("cid01", 0, "Option A")
+
+        with patch("tools.clarify_gateway.resolve_gateway_clarify", return_value=True) as resolve_mock, \
+             patch("tools.clarify_gateway._entries", {"cid01": SimpleNamespace(question="Q?", choices=["Option A", "Option B"])}, create=True):
+            response = await adapter._on_clarify_action(ctx)
+
+        resolve_mock.assert_called_once_with("cid01", "Option A")
+        assert response.status == 200
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_click_does_not_resolve(self, monkeypatch):
+        monkeypatch.delenv("TEAMS_ALLOWED_USERS", raising=False)
+        monkeypatch.delenv("TEAMS_ALLOW_ALL_USERS", raising=False)
+        adapter = _make_adapter()
+        ctx = self._make_click_ctx("cid01", 0, "Option A")
+
+        with patch("tools.clarify_gateway.resolve_gateway_clarify") as resolve_mock:
+            response = await adapter._on_clarify_action(ctx)
+        resolve_mock.assert_not_called()
+        assert response.status == 200
+        # Body carries the deny reason
+        body_value = getattr(response.body, "value", "") or ""
+        assert "TEAMS_ALLOWED_USERS" in body_value or "Not authorized" in body_value
+
+    @pytest.mark.asyncio
+    async def test_stale_card_returns_already_resolved_message(self, monkeypatch):
+        """If the clarify entry is gone (resolved or timed out), return a friendly card update."""
+        monkeypatch.setenv("TEAMS_ALLOW_ALL_USERS", "true")
+        adapter = _make_adapter()
+        ctx = self._make_click_ctx("cid_gone", 0, "Option A")
+
+        with patch("tools.clarify_gateway._entries", {}, create=True), \
+             patch("tools.clarify_gateway.resolve_gateway_clarify") as resolve_mock:
+            response = await adapter._on_clarify_action(ctx)
+        resolve_mock.assert_not_called()
+        # Body should be a card with an "expired" message
+        assert response.status == 200

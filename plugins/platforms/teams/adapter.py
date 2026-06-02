@@ -1560,10 +1560,96 @@ class TeamsAdapter(BasePlatformAdapter):
     async def _on_clarify_action(
         self, ctx: "ActivityContext[AdaptiveCardInvokeActivity]"
     ) -> "InvokeResponse[AdaptiveCardActionMessageResponse]":
-        """Handle a clarify-card button click. Implemented in Phase D."""
+        """Handle a clarify-card button click."""
+        from tools.clarify_gateway import (
+            resolve_gateway_clarify,
+            mark_awaiting_text,
+            _entries as _clarify_entries,  # type: ignore[attr-defined]
+        )
+
+        # 1. Authorize
+        ok, reason = self._authorize_card_clicker(ctx)
+        if not ok:
+            return InvokeResponse(
+                status=200,
+                body=AdaptiveCardActionMessageResponse(value=reason),
+            )
+
+        # 2. Extract payload
+        action = ctx.activity.value.action
+        data = action.data or {}
+        clarify_id = data.get("clarify_id", "")
+        choice_idx = data.get("choice_idx")
+        choice_text = data.get("choice_text", "")
+
+        if not clarify_id:
+            return InvokeResponse(
+                status=200,
+                body=AdaptiveCardActionMessageResponse(value="Unknown clarify action."),
+            )
+
+        # 3. Stale-card check — entry may have been resolved or timed out
+        entry = _clarify_entries.get(clarify_id)
+        if entry is None:
+            return InvokeResponse(
+                status=200,
+                body=AdaptiveCardActionCardResponse(
+                    value=AdaptiveCard()
+                    .with_version("1.4")
+                    .with_body([
+                        TextBlock(text="⚠️ Question already answered or expired.", wrap=True),
+                    ]),
+                ),
+            )
+
+        # 4. "Other" — flip to text-capture and tell the user
+        if choice_idx == "other":
+            mark_awaiting_text(clarify_id)
+            return InvokeResponse(
+                status=200,
+                body=AdaptiveCardActionCardResponse(
+                    value=AdaptiveCard()
+                    .with_version("1.4")
+                    .with_body([
+                        TextBlock(text=f"❓ {entry.question}", wrap=True, weight="Bolder"),
+                        TextBlock(
+                            text="✏️ Type your answer as your next message.",
+                            wrap=True,
+                            isSubtle=True,
+                        ),
+                    ]),
+                ),
+            )
+
+        # 5. Resolve to chosen text. Fall back to entry.choices[idx] if the truncated
+        #    payload text is missing (defensive — the data round-trip is short but
+        #    not guaranteed to preserve every char).
+        resolved_text = choice_text
+        if not resolved_text:
+            try:
+                resolved_text = entry.choices[int(choice_idx)]
+            except (ValueError, IndexError, AttributeError, TypeError):
+                resolved_text = str(choice_idx)
+
+        try:
+            resolve_gateway_clarify(clarify_id, resolved_text)
+        except Exception as exc:
+            logger.error("[teams] resolve_gateway_clarify failed for %s: %s", clarify_id, exc)
+            return InvokeResponse(
+                status=200,
+                body=AdaptiveCardActionMessageResponse(value="Failed to record your answer."),
+            )
+
         return InvokeResponse(
             status=200,
-            body=AdaptiveCardActionMessageResponse(value="Clarify handler not yet implemented."),
+            body=AdaptiveCardActionCardResponse(
+                value=AdaptiveCard()
+                .with_version("1.4")
+                .with_body([
+                    TextBlock(text=f"❓ {entry.question}", wrap=True, weight="Bolder"),
+                    TextBlock(text=f"✅ You picked: {resolved_text}", wrap=True),
+                ]),
+            ),
         )
 
     async def send_exec_approval(
