@@ -633,3 +633,43 @@ class TestLateImportBindings:
             "Add the import to the deferred-init block AND the assignment line "
             "(see plugins/platforms/teams/adapter.py around lines 446 and 461)."
         )
+
+    def test_check_requirements_rebinds_globals_after_clear(self, monkeypatch):
+        """Regression: ``check_requirements()`` must rebind module globals via
+        the ``global`` declaration, not just create local variables.
+
+        The original deferred-init fix added ``Choice, ChoiceSetInput =
+        _Choice, _ChoiceSetInput`` but forgot to declare them ``global``, so
+        the assignments only set locals and the module namespace remained
+        unchanged — reproducing the production NameError. This test simulates
+        the deferred path by clearing the globals first, then calling
+        ``check_requirements()``, and asserts the names reappear.
+        """
+        # Skip if SDK isn't installed in this environment
+        if not getattr(teams_adapter_module, "TEAMS_SDK_AVAILABLE", False):
+            pytest.skip("microsoft_teams SDK not available in this env")
+
+        symbols = ("AdaptiveCard", "ExecuteAction", "TextBlock", "Choice", "ChoiceSetInput")
+
+        # Snapshot then clear via monkeypatch so pytest restores them on teardown
+        for name in symbols + ("TEAMS_SDK_AVAILABLE", "AIOHTTP_AVAILABLE"):
+            monkeypatch.setattr(teams_adapter_module, name, None, raising=False)
+
+        # Sanity: globals are cleared
+        for name in symbols:
+            assert getattr(teams_adapter_module, name) is None, (
+                f"setup failed: {name} not cleared"
+            )
+
+        # Now invoke the deferred-init path
+        ok = teams_adapter_module.check_requirements()
+        assert ok, "check_requirements() returned False after clearing globals"
+
+        # All symbols must be re-bound to non-None values
+        unbound = [n for n in symbols if getattr(teams_adapter_module, n, None) is None]
+        assert not unbound, (
+            f"check_requirements() did not rebind module globals: {unbound}. "
+            "This usually means the assignment is missing a ``global`` declaration "
+            "at the top of the function — the assignment becomes a local instead "
+            "of updating module state."
+        )

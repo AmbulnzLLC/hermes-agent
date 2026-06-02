@@ -94,6 +94,8 @@ except ImportError:
     AdaptiveCard = None  # type: ignore[assignment,misc]
     ExecuteAction = None  # type: ignore[assignment,misc]
     TextBlock = None  # type: ignore[assignment,misc]
+    Choice = None  # type: ignore[assignment,misc]
+    ChoiceSetInput = None  # type: ignore[assignment,misc]
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
@@ -415,6 +417,7 @@ def check_requirements() -> bool:
     global InvokeResponse, AdaptiveCardInvokeResponse
     global HttpMethod, HttpRequest, HttpResponse, HttpRouteHandler
     global AdaptiveCard, ExecuteAction, TextBlock
+    global Choice, ChoiceSetInput
 
     if TEAMS_SDK_AVAILABLE and AIOHTTP_AVAILABLE:
         return True
