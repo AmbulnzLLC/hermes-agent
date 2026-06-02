@@ -70,3 +70,57 @@ class TestAuthorizeCardClicker:
         ctx = _ctx_with_clicker(aad_oid="anyone")
         ok, _ = adapter._authorize_card_clicker(ctx)
         assert ok is True
+
+
+class TestVerbRouting:
+    """The card action dispatcher must route hermes_clarify to _on_clarify_action."""
+
+    @pytest.mark.asyncio
+    async def test_hermes_clarify_verb_dispatches_to_clarify_handler(self, monkeypatch):
+        monkeypatch.setenv("TEAMS_ALLOW_ALL_USERS", "true")
+        adapter = _make_adapter()
+
+        # Build a card-action context with verb=hermes_clarify
+        action = SimpleNamespace(verb="hermes_clarify", data={"clarify_id": "abc123", "choice_idx": 0})
+        ctx = SimpleNamespace(
+            activity=SimpleNamespace(
+                value=SimpleNamespace(action=action),
+                from_=SimpleNamespace(aad_object_id="u1", id="u1"),
+            )
+        )
+
+        # Patch _on_clarify_action to a sentinel
+        sentinel = MagicMock(return_value="CLARIFY_HANDLED")
+        async def fake_clarify_handler(c):
+            return sentinel(c)
+        adapter._on_clarify_action = fake_clarify_handler
+
+        result = await adapter._on_card_action(ctx)
+        sentinel.assert_called_once_with(ctx)
+        assert result == "CLARIFY_HANDLED"
+
+    @pytest.mark.asyncio
+    async def test_unknown_verb_falls_through_to_approval_path(self, monkeypatch):
+        """Defensive: a missing/unknown verb should not be misrouted to clarify."""
+        monkeypatch.setenv("TEAMS_ALLOW_ALL_USERS", "true")
+        adapter = _make_adapter()
+        # Action with verb=hermes_approve and a known approval shape — should hit approval logic,
+        # not clarify. We assert clarify handler is NOT called.
+        action = SimpleNamespace(
+            verb="hermes_approve",
+            data={"hermes_action": "approve_once", "session_key": "sess1", "cmd": "ls", "desc": "test"},
+        )
+        ctx = SimpleNamespace(
+            activity=SimpleNamespace(
+                value=SimpleNamespace(action=action),
+                from_=SimpleNamespace(aad_object_id="u1", id="u1"),
+            )
+        )
+        clarify_mock = MagicMock()
+        async def fake_clarify_handler(c):
+            clarify_mock(c)
+        adapter._on_clarify_action = fake_clarify_handler
+
+        with patch("tools.approval.has_blocking_approval", return_value=False):
+            await adapter._on_card_action(ctx)
+        clarify_mock.assert_not_called()

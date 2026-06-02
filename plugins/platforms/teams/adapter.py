@@ -1485,6 +1485,9 @@ class TeamsAdapter(BasePlatformAdapter):
 
         action = ctx.activity.value.action
         data = action.data or {}
+        verb = getattr(action, "verb", "") or ""
+        if verb == "hermes_clarify":
+            return await self._on_clarify_action(ctx)
         hermes_action = data.get("hermes_action", "")
         session_key = data.get("session_key", "")
 
@@ -1552,6 +1555,15 @@ class TeamsAdapter(BasePlatformAdapter):
             body=AdaptiveCardActionCardResponse(
                 value=AdaptiveCard().with_version("1.4").with_body(body)
             ),
+        )
+
+    async def _on_clarify_action(
+        self, ctx: "ActivityContext[AdaptiveCardInvokeActivity]"
+    ) -> "InvokeResponse[AdaptiveCardActionMessageResponse]":
+        """Handle a clarify-card button click. Implemented in Phase D."""
+        return InvokeResponse(
+            status=200,
+            body=AdaptiveCardActionMessageResponse(value="Clarify handler not yet implemented."),
         )
 
     async def send_exec_approval(
