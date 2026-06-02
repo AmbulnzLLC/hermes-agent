@@ -321,7 +321,7 @@ class GatewayStreamConsumer:
         barrier = _DrainBarrier()
         self._queue.put(barrier)
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             await asyncio.wait_for(
                 loop.run_in_executor(None, barrier.event.wait, timeout),
                 timeout=timeout + 0.5,
@@ -473,232 +473,233 @@ class GatewayStreamConsumer:
                 got_segment_break = False
                 commentary_text = None
                 pending_barrier: Optional[_DrainBarrier] = None
-                while True:
-                    try:
-                        item = self._queue.get_nowait()
-                        if item is _DONE:
-                            got_done = True
+                try:
+                    while True:
+                        try:
+                            item = self._queue.get_nowait()
+                            if item is _DONE:
+                                got_done = True
+                                break
+                            if item is _NEW_SEGMENT:
+                                got_segment_break = True
+                                break
+                            if isinstance(item, _DrainBarrier):
+                                # Ordering barrier: everything enqueued before it
+                                # has now been pulled.  Break out so the existing
+                                # flush logic below pushes any pending accumulated
+                                # text to the adapter, then resolve the barrier at
+                                # the end of this outer iteration.
+                                pending_barrier = item
+                                break
+                            if isinstance(item, tuple) and len(item) == 2 and item[0] is _COMMENTARY:
+                                commentary_text = item[1]
+                                break
+                            self._filter_and_accumulate(item)
+                        except queue.Empty:
                             break
-                        if item is _NEW_SEGMENT:
-                            got_segment_break = True
-                            break
-                        if isinstance(item, _DrainBarrier):
-                            # Ordering barrier: everything enqueued before it
-                            # has now been pulled.  Break out so the existing
-                            # flush logic below pushes any pending accumulated
-                            # text to the adapter, then resolve the barrier at
-                            # the end of this outer iteration.
-                            pending_barrier = item
-                            break
-                        if isinstance(item, tuple) and len(item) == 2 and item[0] is _COMMENTARY:
-                            commentary_text = item[1]
-                            break
-                        self._filter_and_accumulate(item)
-                    except queue.Empty:
-                        break
 
-                # Flush any held-back partial-tag buffer on stream end
-                # so trailing text that was waiting for a potential open
-                # tag is not lost.
-                if got_done:
-                    self._flush_think_buffer()
+                    # Flush any held-back partial-tag buffer on stream end
+                    # so trailing text that was waiting for a potential open
+                    # tag is not lost.
+                    if got_done:
+                        self._flush_think_buffer()
 
-                # Decide whether to flush an edit
-                now = time.monotonic()
-                elapsed = now - self._last_edit_time
-                should_edit = (
-                    got_done
-                    or got_segment_break
-                    or commentary_text is not None
-                    # A pending drain barrier must flush any accumulated text
-                    # to the adapter before its event is set, so the out-of-band
-                    # caller (e.g. clarify card) lands strictly after this text.
-                    or pending_barrier is not None
-                )
-                if not self.cfg.buffer_only:
-                    should_edit = should_edit or (
-                        (elapsed >= self._current_edit_interval
-                            and self._accumulated)
-                        # buffer_threshold is intentionally codepoint-based:
-                        # it's a debounce heuristic ("send updates roughly
-                        # every N visible characters"), not a platform-limit
-                        # check. _len_fn is reserved for overflow detection.
-                        or len(self._accumulated) >= self.cfg.buffer_threshold
+                    # Decide whether to flush an edit
+                    now = time.monotonic()
+                    elapsed = now - self._last_edit_time
+                    should_edit = (
+                        got_done
+                        or got_segment_break
+                        or commentary_text is not None
+                        # A pending drain barrier must flush any accumulated text
+                        # to the adapter before its event is set, so the out-of-band
+                        # caller (e.g. clarify card) lands strictly after this text.
+                        or pending_barrier is not None
                     )
-
-                current_update_visible = False
-                if should_edit and self._accumulated:
-                    # Split overflow: if accumulated text exceeds the platform
-                    # limit, split into properly sized chunks.
-                    if (
-                        _len_fn(self._accumulated) > _safe_limit
-                        and self._message_id is None
-                    ):
-                        # No existing message to edit (first message or after a
-                        # segment break).  Use truncate_message — the same
-                        # helper the non-streaming path uses — to split with
-                        # proper word/code-fence boundaries and chunk
-                        # indicators like "(1/2)".
-                        chunks = self.adapter.truncate_message(
-                            self._accumulated, _safe_limit, len_fn=_len_fn,
+                    if not self.cfg.buffer_only:
+                        should_edit = should_edit or (
+                            (elapsed >= self._current_edit_interval
+                                and self._accumulated)
+                            # buffer_threshold is intentionally codepoint-based:
+                            # it's a debounce heuristic ("send updates roughly
+                            # every N visible characters"), not a platform-limit
+                            # check. _len_fn is reserved for overflow detection.
+                            or len(self._accumulated) >= self.cfg.buffer_threshold
                         )
-                        chunks_delivered = False
-                        reply_to = self._message_id or self._initial_reply_to_id
-                        for chunk in chunks:
-                            new_id = await self._send_new_chunk(chunk, reply_to)
-                            if new_id is not None and new_id != reply_to:
-                                chunks_delivered = True
-                        self._accumulated = ""
-                        self._last_sent_text = ""
-                        self._last_edit_time = time.monotonic()
-                        if got_done:
-                            # Only claim final delivery if THESE chunks actually
-                            # landed.  ``_already_sent`` may be True from prior
-                            # tool-progress edits or fallback-mode promotion (#10748)
-                            # — that doesn't mean the final answer reached the user.
-                            self._final_response_sent = chunks_delivered
-                            if chunks_delivered:
-                                self._final_content_delivered = True
-                            return
-                        if got_segment_break:
-                            self._message_id = None
-                            self._fallback_final_send = False
-                            self._fallback_prefix = ""
-                        if pending_barrier is not None:
-                            # Accumulated text was just flushed as chunk
-                            # messages above; the barrier's prior text has
-                            # landed, so resolve it before looping.
-                            pending_barrier.event.set()
-                        continue
 
-                    # Existing message: edit it with the first chunk, then
-                    # start a new message for the overflow remainder.
-                    while (
-                        _len_fn(self._accumulated) > _safe_limit
-                        and self._message_id is not None
-                        and self._edit_supported
-                    ):
-                        _cp_budget = _custom_unit_to_cp(
-                            self._accumulated, _safe_limit, _len_fn,
-                        )
-                        split_at = self._accumulated.rfind("\n", 0, _cp_budget)
-                        if split_at < _safe_limit // 2:
-                            split_at = _safe_limit
-                        chunk = self._accumulated[:split_at]
-                        ok = await self._send_or_edit(chunk)
-                        if self._fallback_final_send or not ok:
-                            # Edit failed (or backed off due to flood control)
-                            # while attempting to split an oversized message.
-                            # Keep the full accumulated text intact so the
-                            # fallback final-send path can deliver the remaining
-                            # continuation without dropping content.
-                            break
-                        self._accumulated = self._accumulated[split_at:].lstrip("\n")
-                        self._message_id = None
-                        self._last_sent_text = ""
-
-                    display_text = self._accumulated
-                    if (
-                        not got_done
-                        and not got_segment_break
-                        and commentary_text is None
-                        and pending_barrier is None
-                    ):
-                        display_text += self.cfg.cursor
-
-                    # Segment break: finalize the current message so platforms
-                    # that need explicit closure (e.g. DingTalk AI Cards) don't
-                    # leave the previous segment stuck in a loading state when
-                    # the next segment (tool progress, next chunk) creates a
-                    # new message below it.  got_done has its own finalize
-                    # path below so we don't finalize here for it.
-                    current_update_visible = await self._send_or_edit(
-                        display_text,
-                        finalize=(got_done or got_segment_break),
-                    )
-                    self._last_edit_time = time.monotonic()
-
-                if got_done:
-                    # Final edit without cursor. If progressive editing failed
-                    # mid-stream, send a single continuation/fallback message
-                    # here instead of letting the base gateway path send the
-                    # full response again.
-                    if self._accumulated:
-                        if self._fallback_final_send:
-                            await self._send_fallback_final(self._accumulated)
-                        elif (
-                            current_update_visible
-                            and not self._adapter_requires_finalize
+                    current_update_visible = False
+                    if should_edit and self._accumulated:
+                        # Split overflow: if accumulated text exceeds the platform
+                        # limit, split into properly sized chunks.
+                        if (
+                            _len_fn(self._accumulated) > _safe_limit
+                            and self._message_id is None
                         ):
-                            # Mid-stream edit above already delivered the
-                            # final accumulated content.  Skip the redundant
-                            # final edit — but only for adapters that don't
-                            # need an explicit finalize signal.
-                            self._final_response_sent = True
-                            self._final_content_delivered = True
-                        elif self._message_id:
-                            # Either the mid-stream edit didn't run (no
-                            # visible update this tick) OR the adapter needs
-                            # explicit finalize=True to close the stream.
-                            self._final_response_sent = await self._send_or_edit(
-                                self._accumulated, finalize=True,
+                            # No existing message to edit (first message or after a
+                            # segment break).  Use truncate_message — the same
+                            # helper the non-streaming path uses — to split with
+                            # proper word/code-fence boundaries and chunk
+                            # indicators like "(1/2)".
+                            chunks = self.adapter.truncate_message(
+                                self._accumulated, _safe_limit, len_fn=_len_fn,
                             )
-                            if self._final_response_sent:
+                            chunks_delivered = False
+                            reply_to = self._message_id or self._initial_reply_to_id
+                            for chunk in chunks:
+                                new_id = await self._send_new_chunk(chunk, reply_to)
+                                if new_id is not None and new_id != reply_to:
+                                    chunks_delivered = True
+                            self._accumulated = ""
+                            self._last_sent_text = ""
+                            self._last_edit_time = time.monotonic()
+                            if got_done:
+                                # Only claim final delivery if THESE chunks actually
+                                # landed.  ``_already_sent`` may be True from prior
+                                # tool-progress edits or fallback-mode promotion (#10748)
+                                # — that doesn't mean the final answer reached the user.
+                                self._final_response_sent = chunks_delivered
+                                if chunks_delivered:
+                                    self._final_content_delivered = True
+                                return
+                            if got_segment_break:
+                                self._message_id = None
+                                self._fallback_final_send = False
+                                self._fallback_prefix = ""
+                            # The drain barrier (if any) is resolved by the
+                            # per-iteration finally below, even on this continue.
+                            continue
+
+                        # Existing message: edit it with the first chunk, then
+                        # start a new message for the overflow remainder.
+                        while (
+                            _len_fn(self._accumulated) > _safe_limit
+                            and self._message_id is not None
+                            and self._edit_supported
+                        ):
+                            _cp_budget = _custom_unit_to_cp(
+                                self._accumulated, _safe_limit, _len_fn,
+                            )
+                            split_at = self._accumulated.rfind("\n", 0, _cp_budget)
+                            if split_at < _safe_limit // 2:
+                                split_at = _safe_limit
+                            chunk = self._accumulated[:split_at]
+                            ok = await self._send_or_edit(chunk)
+                            if self._fallback_final_send or not ok:
+                                # Edit failed (or backed off due to flood control)
+                                # while attempting to split an oversized message.
+                                # Keep the full accumulated text intact so the
+                                # fallback final-send path can deliver the remaining
+                                # continuation without dropping content.
+                                break
+                            self._accumulated = self._accumulated[split_at:].lstrip("\n")
+                            self._message_id = None
+                            self._last_sent_text = ""
+
+                        display_text = self._accumulated
+                        if (
+                            not got_done
+                            and not got_segment_break
+                            and commentary_text is None
+                            and pending_barrier is None
+                        ):
+                            display_text += self.cfg.cursor
+
+                        # Segment break: finalize the current message so platforms
+                        # that need explicit closure (e.g. DingTalk AI Cards) don't
+                        # leave the previous segment stuck in a loading state when
+                        # the next segment (tool progress, next chunk) creates a
+                        # new message below it.  got_done has its own finalize
+                        # path below so we don't finalize here for it.
+                        current_update_visible = await self._send_or_edit(
+                            display_text,
+                            finalize=(got_done or got_segment_break),
+                        )
+                        self._last_edit_time = time.monotonic()
+
+                    if got_done:
+                        # Final edit without cursor. If progressive editing failed
+                        # mid-stream, send a single continuation/fallback message
+                        # here instead of letting the base gateway path send the
+                        # full response again.
+                        if self._accumulated:
+                            if self._fallback_final_send:
+                                await self._send_fallback_final(self._accumulated)
+                            elif (
+                                current_update_visible
+                                and not self._adapter_requires_finalize
+                            ):
+                                # Mid-stream edit above already delivered the
+                                # final accumulated content.  Skip the redundant
+                                # final edit — but only for adapters that don't
+                                # need an explicit finalize signal.
+                                self._final_response_sent = True
                                 self._final_content_delivered = True
-                        elif not self._already_sent:
-                            self._final_response_sent = await self._send_or_edit(self._accumulated)
-                            if self._final_response_sent:
-                                self._final_content_delivered = True
-                    return
+                            elif self._message_id:
+                                # Either the mid-stream edit didn't run (no
+                                # visible update this tick) OR the adapter needs
+                                # explicit finalize=True to close the stream.
+                                self._final_response_sent = await self._send_or_edit(
+                                    self._accumulated, finalize=True,
+                                )
+                                if self._final_response_sent:
+                                    self._final_content_delivered = True
+                            elif not self._already_sent:
+                                self._final_response_sent = await self._send_or_edit(self._accumulated)
+                                if self._final_response_sent:
+                                    self._final_content_delivered = True
+                        return
 
-                if commentary_text is not None:
-                    self._reset_segment_state()
-                    await self._send_commentary(commentary_text)
-                    self._last_edit_time = time.monotonic()
-                    self._reset_segment_state()
+                    if commentary_text is not None:
+                        self._reset_segment_state()
+                        await self._send_commentary(commentary_text)
+                        self._last_edit_time = time.monotonic()
+                        self._reset_segment_state()
 
-                # Tool boundary: reset message state so the next text chunk
-                # creates a fresh message below any tool-progress messages.
-                #
-                # Exception: when _message_id is "__no_edit__" the platform
-                # never returned a real message ID (e.g. Signal, webhook with
-                # github_comment delivery).  Resetting to None would re-enter
-                # the "first send" path on every tool boundary and post one
-                # platform message per tool call — that is what caused 155
-                # comments under a single PR.  Instead, preserve the sentinel
-                # so the full continuation is delivered once via
-                # _send_fallback_final.
-                # (When editing fails mid-stream due to flood control the id is
-                # a real string like "msg_1", not "__no_edit__", so that case
-                # still resets and creates a fresh segment as intended.)
-                if got_segment_break:
-                    # If the segment-break edit failed to deliver the
-                    # accumulated content (flood control that has not yet
-                    # promoted to fallback mode, or fallback mode itself),
-                    # _accumulated still holds pre-boundary text the user
-                    # never saw. Flush that tail as a continuation message
-                    # before the reset below wipes _accumulated — otherwise
-                    # text generated before the tool boundary is silently
-                    # dropped (issue #8124).
-                    if (
-                        self._accumulated
-                        and not current_update_visible
-                        and self._message_id
-                        and self._message_id != "__no_edit__"
-                    ):
-                        await self._flush_segment_tail_on_edit_failure()
-                    self._reset_segment_state(preserve_no_edit=True)
+                    # Tool boundary: reset message state so the next text chunk
+                    # creates a fresh message below any tool-progress messages.
+                    #
+                    # Exception: when _message_id is "__no_edit__" the platform
+                    # never returned a real message ID (e.g. Signal, webhook with
+                    # github_comment delivery).  Resetting to None would re-enter
+                    # the "first send" path on every tool boundary and post one
+                    # platform message per tool call — that is what caused 155
+                    # comments under a single PR.  Instead, preserve the sentinel
+                    # so the full continuation is delivered once via
+                    # _send_fallback_final.
+                    # (When editing fails mid-stream due to flood control the id is
+                    # a real string like "msg_1", not "__no_edit__", so that case
+                    # still resets and creates a fresh segment as intended.)
+                    if got_segment_break:
+                        # If the segment-break edit failed to deliver the
+                        # accumulated content (flood control that has not yet
+                        # promoted to fallback mode, or fallback mode itself),
+                        # _accumulated still holds pre-boundary text the user
+                        # never saw. Flush that tail as a continuation message
+                        # before the reset below wipes _accumulated — otherwise
+                        # text generated before the tool boundary is silently
+                        # dropped (issue #8124).
+                        if (
+                            self._accumulated
+                            and not current_update_visible
+                            and self._message_id
+                            and self._message_id != "__no_edit__"
+                        ):
+                            await self._flush_segment_tail_on_edit_failure()
+                        self._reset_segment_state(preserve_no_edit=True)
 
-                # Resolve any pending drain barrier now that the flush
-                # decision/send for this iteration has completed.  Reaching
-                # this point means all text enqueued before the barrier has
-                # been pushed to the adapter (or there was none pending), so
-                # an out-of-band caller (e.g. the clarify card) blocked on the
-                # barrier event may now proceed strictly after the text.
-                if pending_barrier is not None:
-                    pending_barrier.event.set()
-
-                await asyncio.sleep(0.05)  # Small yield to not busy-loop
+                    await asyncio.sleep(0.05)  # Small yield to not busy-loop
+                finally:
+                    # Guarantee the drain barrier is resolved on EVERY exit
+                    # path of this loop iteration: normal fall-through, the two
+                    # early returns above, a continue, or any exception that
+                    # propagates to the outer except handlers (the per-iteration
+                    # finally runs before control leaves the loop body). Once a
+                    # _DrainBarrier is popped from the queue its event MUST be
+                    # set before run() returns or re-raises, otherwise drain()
+                    # waits the full timeout against a dead consumer. Setting an
+                    # already-set threading.Event is a harmless no-op.
+                    if pending_barrier is not None:
+                        pending_barrier.event.set()
 
         except asyncio.CancelledError:
             # Best-effort final edit on cancellation
