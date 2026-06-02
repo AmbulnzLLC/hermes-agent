@@ -69,7 +69,7 @@ try:
         HttpResponse,
         HttpRouteHandler,
     )
-    from microsoft_teams.cards import AdaptiveCard, ExecuteAction, TextBlock
+    from microsoft_teams.cards import AdaptiveCard, Choice, ChoiceSetInput, ExecuteAction, TextBlock
 
     TEAMS_SDK_AVAILABLE = True
 except ImportError:
@@ -94,6 +94,8 @@ except ImportError:
     AdaptiveCard = None  # type: ignore[assignment,misc]
     ExecuteAction = None  # type: ignore[assignment,misc]
     TextBlock = None  # type: ignore[assignment,misc]
+    Choice = None  # type: ignore[assignment,misc]
+    ChoiceSetInput = None  # type: ignore[assignment,misc]
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
@@ -415,6 +417,7 @@ def check_requirements() -> bool:
     global InvokeResponse, AdaptiveCardInvokeResponse
     global HttpMethod, HttpRequest, HttpResponse, HttpRouteHandler
     global AdaptiveCard, ExecuteAction, TextBlock
+    global Choice, ChoiceSetInput
 
     if TEAMS_SDK_AVAILABLE and AIOHTTP_AVAILABLE:
         return True
@@ -443,7 +446,13 @@ def check_requirements() -> bool:
             HttpResponse as _HttpResponse,
             HttpRouteHandler as _HttpRouteHandler,
         )
-        from microsoft_teams.cards import AdaptiveCard as _AdaptiveCard, ExecuteAction as _ExecuteAction, TextBlock as _TextBlock
+        from microsoft_teams.cards import (
+            AdaptiveCard as _AdaptiveCard,
+            Choice as _Choice,
+            ChoiceSetInput as _ChoiceSetInput,
+            ExecuteAction as _ExecuteAction,
+            TextBlock as _TextBlock,
+        )
     except ImportError:
         return False
     web = _web
@@ -459,6 +468,7 @@ def check_requirements() -> bool:
     HttpMethod, HttpRequest = _HttpMethod, _HttpRequest
     HttpResponse, HttpRouteHandler = _HttpResponse, _HttpRouteHandler
     AdaptiveCard, ExecuteAction, TextBlock = _AdaptiveCard, _ExecuteAction, _TextBlock
+    Choice, ChoiceSetInput = _Choice, _ChoiceSetInput
     AIOHTTP_AVAILABLE = True
     TEAMS_SDK_AVAILABLE = True
     return True
@@ -1582,6 +1592,15 @@ class TeamsAdapter(BasePlatformAdapter):
         choice_idx = data.get("choice_idx")
         choice_text = data.get("choice_text", "")
 
+        # ChoiceSet layout: the user's selection arrives as the input value
+        # under our distinctive input id ("clarify_choice_value"). Translate
+        # it back into choice_idx so the rest of the flow is uniform.
+        if data.get("kind") == "choiceset" and choice_idx is None:
+            try:
+                choice_idx = int(data.get("clarify_choice_value", "0"))
+            except (ValueError, TypeError):
+                choice_idx = 0
+
         if not clarify_id:
             return InvokeResponse(
                 status=200,
@@ -1723,12 +1742,26 @@ class TeamsAdapter(BasePlatformAdapter):
         session_key: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Render a clarify prompt as an Adaptive Card with one button per choice.
+        """Render a clarify prompt as an Adaptive Card.
 
-        Multiple-choice mode (``choices`` non-empty): renders the question as a
-        TextBlock and each choice as an ``ExecuteAction`` with verb
-        ``hermes_clarify``. Appends a final "Other (type your answer)" action
-        that flips the clarify primitive into text-capture mode on click.
+        Multiple-choice mode (``choices`` non-empty) picks one of two layouts
+        depending on the longest choice label:
+
+        * **Short-label layout** — every choice fits in a Teams action button
+          (no label exceeds ``LONG_CHOICE_THRESHOLD`` chars). Each choice is
+          rendered as an ``ExecuteAction`` with verb ``hermes_clarify``.
+        * **Long-label layout** — at least one choice exceeds the threshold.
+          Teams clips Action.Submit titles to a single line and silently
+          truncates overflow, so we render the choices as an
+          ``Input.ChoiceSet`` (compact dropdown) with ``wrap=True`` on the
+          choice titles, plus a single Submit ``ExecuteAction``. The dropdown
+          honors text wrap.
+
+        Both layouts append a final "Other (type your answer)" action and
+        call ``mark_awaiting_text`` at send time so the user can either pick
+        a choice OR type free-form text in chat — both paths resolve the
+        clarify. Button click still wins (``resolve_gateway_clarify`` removes
+        the entry, so the text-intercept finds nothing).
 
         Open-ended mode (``choices`` is None or empty): falls back to a plain
         text message + ``mark_awaiting_text`` so the gateway's text-intercept
@@ -1746,26 +1779,83 @@ class TeamsAdapter(BasePlatformAdapter):
                 metadata=metadata,
             )
 
+        # Choice path: arm the text-intercept up front so the user can also
+        # resolve the clarify by typing free-form text without clicking
+        # "Other" first. Button click still wins (resolve_gateway_clarify
+        # removes the entry, so the text-intercept finds nothing).
+        from tools.clarify_gateway import mark_awaiting_text
+        mark_awaiting_text(clarify_id)
+
         # Defensive cap — clarify_tool should already truncate to MAX_CHOICES=4,
         # but never trust upstream invariants in a render path.
         MAX_BUTTONS = 4
+        # Threshold above which Teams will clip an Action.Submit title; chosen
+        # conservatively. Anything at or below this comfortably fits one line
+        # in a stacked card layout; above it we switch to ChoiceSet which
+        # honors wrap.
+        LONG_CHOICE_THRESHOLD = 30
         bounded = list(choices)[:MAX_BUTTONS]
+        use_choiceset = any(len(str(c)) > LONG_CHOICE_THRESHOLD for c in bounded)
 
-        actions = []
-        for idx, choice in enumerate(bounded):
+        body: list = [TextBlock(text=f"❓ {question}", wrap=True, weight="Bolder")]
+        if len(choices) > MAX_BUTTONS:
+            body.append(
+                TextBlock(
+                    text=f"(showing first {MAX_BUTTONS} of {len(choices)} options)",
+                    wrap=True,
+                    isSubtle=True,
+                )
+            )
+
+        actions: list = []
+        if use_choiceset:
+            # Long labels: render as a ChoiceSet dropdown so wrap honors them.
+            # Input id is intentionally distinctive to avoid colliding with
+            # any other data key when Teams merges input values into the
+            # submitted action data.
+            body.append(
+                ChoiceSetInput(
+                    id="clarify_choice_value",
+                    style="compact",
+                    value="0",  # default to first choice
+                    is_required=True,
+                    error_message="Please pick a choice or click Other.",
+                    choices=[
+                        Choice(title=str(c)[:200], value=str(idx))
+                        for idx, c in enumerate(bounded)
+                    ],
+                )
+            )
             actions.append(
                 ExecuteAction(
-                    title=str(choice)[:80],  # Teams card button label cap
+                    title="Submit",
                     verb="hermes_clarify",
                     data={
                         "clarify_id": clarify_id,
                         "session_key": session_key,
-                        "choice_idx": idx,
-                        "choice_text": str(choice)[:200],  # truncate for payload
+                        "kind": "choiceset",
+                        # choice_idx is filled in client-side by the ChoiceSet
+                        # input value (key "clarify_choice_value") — read
+                        # in _on_clarify_action.
                     },
                 )
             )
-        # Always offer a free-text escape hatch
+        else:
+            # Short labels: one button per choice (snappy one-tap UX).
+            for idx, choice in enumerate(bounded):
+                actions.append(
+                    ExecuteAction(
+                        title=str(choice)[:80],  # Teams card button label cap
+                        verb="hermes_clarify",
+                        data={
+                            "clarify_id": clarify_id,
+                            "session_key": session_key,
+                            "choice_idx": idx,
+                            "choice_text": str(choice)[:200],
+                        },
+                    )
+                )
+        # Always offer a free-text escape hatch — short label, never clips
         actions.append(
             ExecuteAction(
                 title="Other (type your answer)",
@@ -1777,16 +1867,6 @@ class TeamsAdapter(BasePlatformAdapter):
                 },
             )
         )
-
-        body = [TextBlock(text=f"❓ {question}", wrap=True, weight="Bolder")]
-        if len(choices) > MAX_BUTTONS:
-            body.append(
-                TextBlock(
-                    text=f"(showing first {MAX_BUTTONS} of {len(choices)} options)",
-                    wrap=True,
-                    isSubtle=True,
-                )
-            )
 
         card = (
             AdaptiveCard()
