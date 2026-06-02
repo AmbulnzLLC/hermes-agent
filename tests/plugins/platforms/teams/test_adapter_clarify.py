@@ -361,3 +361,42 @@ class TestOnClarifyActionOther:
         resolve_mock.assert_not_called()
         mark_mock.assert_called_once_with("cid_other")
         assert response.status == 200
+
+
+class TestClarifyEdgeCases:
+    @pytest.mark.asyncio
+    async def test_missing_clarify_id_returns_unknown(self, monkeypatch):
+        monkeypatch.setenv("TEAMS_ALLOW_ALL_USERS", "true")
+        adapter = _make_adapter()
+        action = SimpleNamespace(verb="hermes_clarify", data={"choice_idx": 0})
+        ctx = SimpleNamespace(
+            activity=SimpleNamespace(
+                value=SimpleNamespace(action=action),
+                from_=SimpleNamespace(aad_object_id="u1", id="u1"),
+            )
+        )
+        response = await adapter._on_clarify_action(ctx)
+        assert response.status == 200
+        assert "Unknown" in (response.body.value or "")
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_entry_choices_when_text_missing(self, monkeypatch):
+        """If choice_text is empty (corrupt payload), look up entry.choices[idx]."""
+        monkeypatch.setenv("TEAMS_ALLOW_ALL_USERS", "true")
+        adapter = _make_adapter()
+        action = SimpleNamespace(
+            verb="hermes_clarify",
+            data={"clarify_id": "cid", "session_key": "s", "choice_idx": 1, "choice_text": ""},
+        )
+        ctx = SimpleNamespace(
+            activity=SimpleNamespace(
+                value=SimpleNamespace(action=action),
+                from_=SimpleNamespace(aad_object_id="u1", id="u1"),
+            )
+        )
+        with patch("tools.clarify_gateway._entries",
+                   {"cid": SimpleNamespace(question="Q?", choices=["A", "B", "C"])},
+                   create=True), \
+             patch("tools.clarify_gateway.resolve_gateway_clarify", return_value=True) as resolve_mock:
+            await adapter._on_clarify_action(ctx)
+        resolve_mock.assert_called_once_with("cid", "B")
