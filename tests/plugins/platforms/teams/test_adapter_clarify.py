@@ -222,6 +222,33 @@ class TestSendClarifyChoices:
         # 4 choice buttons (capped) + 1 "Other" = 5 actions max
         assert len(actions) <= 5
 
+    @pytest.mark.asyncio
+    async def test_choice_path_arms_text_intercept_at_send_time(self):
+        """Free-form text must resolve a choice clarify without clicking 'Other'.
+
+        Regression: a user with a choice card up should be able to type
+        free-form text in chat and have it captured as the clarify response.
+        Pre-fix, the choice path only flipped ``awaiting_text`` when the user
+        clicked the "Other" button, so typing in chat fell through to the
+        agent loop instead of resolving the clarify.
+        """
+        adapter = _make_adapter()
+        async def fake_send_card(chat_id, card):
+            return SimpleNamespace(id="msg-armed")
+        adapter._send_card = fake_send_card
+
+        with patch("tools.clarify_gateway.mark_awaiting_text") as mark_mock:
+            result = await adapter.send_clarify(
+                chat_id="c1",
+                question="Pick one or type something",
+                choices=["A", "B"],
+                clarify_id="cid_armed",
+                session_key="s1",
+            )
+
+        assert result.success is True
+        mark_mock.assert_called_once_with("cid_armed")
+
 
 class TestSendClarifyOpenEnded:
     """send_clarify with no choices uses plain text + mark_awaiting_text."""

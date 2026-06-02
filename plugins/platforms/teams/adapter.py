@@ -1727,8 +1727,11 @@ class TeamsAdapter(BasePlatformAdapter):
 
         Multiple-choice mode (``choices`` non-empty): renders the question as a
         TextBlock and each choice as an ``ExecuteAction`` with verb
-        ``hermes_clarify``. Appends a final "Other (type your answer)" action
-        that flips the clarify primitive into text-capture mode on click.
+        ``hermes_clarify``. Appends a final "Other (type your answer)" action.
+        Calls ``mark_awaiting_text`` at send time so the user can either click
+        a button OR type free-form text in chat — both paths resolve the
+        clarify. The "Other" button is now mostly a UI affordance for users
+        who don't realize typing also works; the text-intercept arms regardless.
 
         Open-ended mode (``choices`` is None or empty): falls back to a plain
         text message + ``mark_awaiting_text`` so the gateway's text-intercept
@@ -1745,6 +1748,13 @@ class TeamsAdapter(BasePlatformAdapter):
                 clarify_id=clarify_id,
                 metadata=metadata,
             )
+
+        # Choice path: arm the text-intercept up front so the user can also
+        # resolve the clarify by typing free-form text without clicking
+        # "Other" first. Button click still wins (resolve_gateway_clarify
+        # removes the entry, so the text-intercept finds nothing).
+        from tools.clarify_gateway import mark_awaiting_text
+        mark_awaiting_text(clarify_id)
 
         # Defensive cap — clarify_tool should already truncate to MAX_CHOICES=4,
         # but never trust upstream invariants in a render path.
