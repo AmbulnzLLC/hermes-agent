@@ -1717,6 +1717,26 @@ class TeamsAdapter(BasePlatformAdapter):
             logger.error("[teams] send_clarify failed: %s", e, exc_info=True)
             return SendResult(success=False, error=str(e), retryable=True)
 
+    async def _send_clarify_text(
+        self,
+        chat_id: str,
+        question: str,
+        clarify_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Open-ended clarify: send plain text + flip into text-capture mode.
+
+        The gateway's text-intercept watches for the next user message in this
+        chat and resolves the clarify primitive with whatever the user types.
+        """
+        from tools.clarify_gateway import mark_awaiting_text
+        mark_awaiting_text(clarify_id)
+        return await self.send(
+            chat_id=chat_id,
+            content=f"❓ {question}",
+            metadata=metadata,
+        )
+
     async def send(
         self,
         chat_id: str,

@@ -221,3 +221,48 @@ class TestSendClarifyChoices:
         actions = card.actions if hasattr(card, "actions") else card._actions
         # 4 choice buttons (capped) + 1 "Other" = 5 actions max
         assert len(actions) <= 5
+
+
+class TestSendClarifyOpenEnded:
+    """send_clarify with no choices uses plain text + mark_awaiting_text."""
+
+    @pytest.mark.asyncio
+    async def test_open_ended_calls_mark_awaiting_text_and_sends_plain(self):
+        adapter = _make_adapter()
+        sent = {}
+        async def fake_send(chat_id, content, reply_to=None, metadata=None):
+            sent["chat_id"] = chat_id
+            sent["content"] = content
+            from gateway.platforms.base import SendResult
+            return SendResult(success=True, message_id="m1")
+        adapter.send = fake_send
+
+        with patch("tools.clarify_gateway.mark_awaiting_text") as mark_mock:
+            result = await adapter.send_clarify(
+                chat_id="c1",
+                question="Free-form answer please?",
+                choices=None,
+                clarify_id="cid_open",
+                session_key="s1",
+            )
+        assert result.success is True
+        mark_mock.assert_called_once_with("cid_open")
+        assert "Free-form answer please?" in sent["content"]
+
+    @pytest.mark.asyncio
+    async def test_empty_list_treated_as_open_ended(self):
+        adapter = _make_adapter()
+        async def fake_send(chat_id, content, reply_to=None, metadata=None):
+            from gateway.platforms.base import SendResult
+            return SendResult(success=True, message_id="m1")
+        adapter.send = fake_send
+
+        with patch("tools.clarify_gateway.mark_awaiting_text") as mark_mock:
+            result = await adapter.send_clarify(
+                chat_id="c1",
+                question="Q?",
+                choices=[],
+                clarify_id="cid_empty",
+                session_key="s1",
+            )
+        mark_mock.assert_called_once_with("cid_empty")
