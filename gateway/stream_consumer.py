@@ -20,6 +20,7 @@ import inspect
 import logging
 import queue
 import re
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
@@ -44,6 +45,24 @@ _NEW_SEGMENT = object()
 # Queue marker for a completed assistant commentary message emitted between
 # API/tool iterations (for example: "I'll inspect the repo first.").
 _COMMENTARY = object()
+
+
+class _DrainBarrier:
+    """Ordering barrier enqueued onto the stream consumer's queue.
+
+    When ``drain()`` is called from another thread (e.g. the agent worker
+    thread that posts the clarify card), it enqueues one of these after all
+    text already queued.  The async ``run()`` loop, upon popping the barrier,
+    flushes any pending accumulated text to the adapter and then sets
+    ``event``.  Because producers (worker thread) and the consumer loop run on
+    different threads, a ``threading.Event`` is used so it can be set from the
+    loop thread and waited on (off-loop, via an executor) from the worker.
+    """
+
+    __slots__ = ("event",)
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
 
 
 @dataclass
@@ -287,6 +306,31 @@ class GatewayStreamConsumer:
         """Signal that the stream is complete."""
         self._queue.put(_DONE)
 
+    async def drain(self, timeout: float = 5.0) -> None:
+        """Block until all text enqueued before this call has been flushed
+        to the adapter. Bounded and best-effort: on timeout, log and return
+        (never hang the caller). Ordering barrier for out-of-band sends
+        (e.g. the clarify card) that must land after streamed commentary.
+
+        Implementation note: ``run()`` and ``drain()`` are coroutines on the
+        same event loop.  We must NOT synchronously block the loop waiting on
+        the barrier event or ``run()`` could never pop the barrier and set it
+        (deadlock).  Instead the blocking ``threading.Event.wait`` is offloaded
+        to a thread executor, freeing the loop so ``run()`` keeps draining.
+        """
+        barrier = _DrainBarrier()
+        self._queue.put(barrier)
+        try:
+            loop = asyncio.get_event_loop()
+            await asyncio.wait_for(
+                loop.run_in_executor(None, barrier.event.wait, timeout),
+                timeout=timeout + 0.5,
+            )
+        except asyncio.TimeoutError:
+            logger.debug("Stream consumer drain timed out after %.1fs", timeout)
+        except Exception as exc:  # noqa: BLE001 — best-effort, never hang caller
+            logger.debug("Stream consumer drain failed: %s", exc)
+
     # ── Think-block filtering ────────────────────────────────────────
     # Models like MiniMax emit inline <think>...</think> blocks in their
     # content.  The CLI's _stream_delta suppresses these via a state
@@ -428,6 +472,7 @@ class GatewayStreamConsumer:
                 got_done = False
                 got_segment_break = False
                 commentary_text = None
+                pending_barrier: Optional[_DrainBarrier] = None
                 while True:
                     try:
                         item = self._queue.get_nowait()
@@ -436,6 +481,14 @@ class GatewayStreamConsumer:
                             break
                         if item is _NEW_SEGMENT:
                             got_segment_break = True
+                            break
+                        if isinstance(item, _DrainBarrier):
+                            # Ordering barrier: everything enqueued before it
+                            # has now been pulled.  Break out so the existing
+                            # flush logic below pushes any pending accumulated
+                            # text to the adapter, then resolve the barrier at
+                            # the end of this outer iteration.
+                            pending_barrier = item
                             break
                         if isinstance(item, tuple) and len(item) == 2 and item[0] is _COMMENTARY:
                             commentary_text = item[1]
@@ -457,6 +510,10 @@ class GatewayStreamConsumer:
                     got_done
                     or got_segment_break
                     or commentary_text is not None
+                    # A pending drain barrier must flush any accumulated text
+                    # to the adapter before its event is set, so the out-of-band
+                    # caller (e.g. clarify card) lands strictly after this text.
+                    or pending_barrier is not None
                 )
                 if not self.cfg.buffer_only:
                     should_edit = should_edit or (
@@ -507,6 +564,11 @@ class GatewayStreamConsumer:
                             self._message_id = None
                             self._fallback_final_send = False
                             self._fallback_prefix = ""
+                        if pending_barrier is not None:
+                            # Accumulated text was just flushed as chunk
+                            # messages above; the barrier's prior text has
+                            # landed, so resolve it before looping.
+                            pending_barrier.event.set()
                         continue
 
                     # Existing message: edit it with the first chunk, then
@@ -536,7 +598,12 @@ class GatewayStreamConsumer:
                         self._last_sent_text = ""
 
                     display_text = self._accumulated
-                    if not got_done and not got_segment_break and commentary_text is None:
+                    if (
+                        not got_done
+                        and not got_segment_break
+                        and commentary_text is None
+                        and pending_barrier is None
+                    ):
                         display_text += self.cfg.cursor
 
                     # Segment break: finalize the current message so platforms
@@ -621,6 +688,15 @@ class GatewayStreamConsumer:
                     ):
                         await self._flush_segment_tail_on_edit_failure()
                     self._reset_segment_state(preserve_no_edit=True)
+
+                # Resolve any pending drain barrier now that the flush
+                # decision/send for this iteration has completed.  Reaching
+                # this point means all text enqueued before the barrier has
+                # been pushed to the adapter (or there was none pending), so
+                # an out-of-band caller (e.g. the clarify card) blocked on the
+                # barrier event may now proceed strictly after the text.
+                if pending_barrier is not None:
+                    pending_barrier.event.set()
 
                 await asyncio.sleep(0.05)  # Small yield to not busy-loop
 
