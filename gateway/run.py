@@ -16949,6 +16949,23 @@ class GatewayRunner:
                 except Exception:
                     pass
 
+                # Ordering barrier: flush any assistant commentary still queued in the
+                # stream consumer so the clarify card never jumps ahead of the text that
+                # introduces it. Best-effort, bounded — never block the clarify path.
+                _sc = stream_consumer_holder[0]
+                if _sc is not None and hasattr(_sc, "drain"):
+                    try:
+                        _drain_fut = safe_schedule_threadsafe(
+                            _sc.drain(timeout=5.0),
+                            _loop_for_step,
+                            logger=logger,
+                            log_message="Clarify pre-flush drain failed to schedule",
+                        )
+                        if _drain_fut is not None:
+                            _drain_fut.result(timeout=6)  # slightly > drain's own timeout
+                    except Exception as exc:
+                        logger.debug("Clarify pre-flush drain skipped: %s", exc)
+
                 send_ok = False
                 fut = safe_schedule_threadsafe(
                     _status_adapter.send_clarify(
@@ -17486,7 +17503,17 @@ class GatewayRunner:
             """Wait for the stream consumer to be created, then run it."""
             for _ in range(200):  # Up to 10s wait
                 if stream_consumer_holder[0] is not None:
-                    await stream_consumer_holder[0].run()
+                    try:
+                        await stream_consumer_holder[0].run()
+                    finally:
+                        # The consumer's run() has finished (or this task was
+                        # cancelled): clear the holder so a clarify firing AFTER
+                        # stream completion does not enqueue a drain barrier onto
+                        # a queue that nobody drains — which would stall the
+                        # worker thread on drain()'s full timeout. The clarify
+                        # callback guards on `_sc is not None`, so resetting here
+                        # makes it skip the (now-pointless) pre-flush drain.
+                        stream_consumer_holder[0] = None
                     return
                 await asyncio.sleep(0.05)
 

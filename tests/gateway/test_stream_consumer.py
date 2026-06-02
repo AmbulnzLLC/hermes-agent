@@ -1908,3 +1908,147 @@ class TestUtf16OverflowDetection:
         # this file passing — they all use MagicMock adapters.
         assert consumer is not None
 
+
+# ── drain() ordering barrier ─────────────────────────────────────────────
+
+
+class TestDrainBarrier:
+    """Verify the bounded drain() barrier flushes queued text before the
+    out-of-band caller (e.g. the clarify card) is allowed to proceed."""
+
+    @pytest.mark.asyncio
+    async def test_drain_resolves_after_enqueued_text_sent(self):
+        """drain() must not return until commentary enqueued before it has
+        been pushed to the adapter — so the card lands strictly after."""
+        adapter = MagicMock()
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_1")
+        )
+        adapter.edit_message = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_1")
+        )
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5, cursor=" ▉")
+        consumer = GatewayStreamConsumer(adapter, "chat_123", config)
+
+        # Enqueue commentary that introduces the upcoming card.
+        consumer.on_commentary("I'll need a quick clarification first.")
+
+        task = asyncio.create_task(consumer.run())
+        try:
+            # Block until everything enqueued so far has been flushed.
+            await consumer.drain(timeout=5.0)
+
+            # By the time drain() returns, the commentary send must have run.
+            assert adapter.send.call_count >= 1
+            sent_texts = [c[1]["content"] for c in adapter.send.call_args_list]
+            assert any("clarification" in t for t in sent_texts), sent_texts
+        finally:
+            consumer.finish()
+            await asyncio.wait_for(task, timeout=2.0)
+
+    @pytest.mark.asyncio
+    async def test_drain_returns_when_idle(self):
+        """drain() on an idle consumer (nothing queued) returns promptly,
+        well under the timeout."""
+        adapter = MagicMock()
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_1")
+        )
+        adapter.edit_message = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_1")
+        )
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        consumer = GatewayStreamConsumer(adapter, "chat_123")
+        task = asyncio.create_task(consumer.run())
+        try:
+            start = asyncio.get_event_loop().time()
+            await consumer.drain(timeout=5.0)
+            elapsed = asyncio.get_event_loop().time() - start
+            # Idle consumer resolves the barrier almost immediately.
+            assert elapsed < 2.0, f"drain() took too long when idle: {elapsed:.2f}s"
+        finally:
+            consumer.finish()
+            await asyncio.wait_for(task, timeout=2.0)
+
+    @pytest.mark.asyncio
+    async def test_drain_bounded_on_stuck_consumer(self):
+        """If run() is never started (queue never drained), drain() must still
+        RETURN within its bounded timeout — it logs and never hangs/raises."""
+        adapter = MagicMock()
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_1")
+        )
+        adapter.edit_message = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_1")
+        )
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        consumer = GatewayStreamConsumer(adapter, "chat_123")
+        # NOTE: deliberately do NOT start consumer.run() — nothing drains the
+        # queue, so the barrier event will never be set by the consumer.
+
+        consumer.on_commentary("text that will never be flushed")
+
+        start = asyncio.get_event_loop().time()
+        # Must return (not raise, not hang) shortly after the bounded timeout.
+        await consumer.drain(timeout=0.2)
+        elapsed = asyncio.get_event_loop().time() - start
+        assert elapsed < 2.0, f"drain() did not stay bounded on stuck consumer: {elapsed:.2f}s"
+
+    @pytest.mark.asyncio
+    async def test_barrier_event_set_when_loop_body_raises_after_pop(self):
+        """Regression for the orphaned-barrier blocker: if run()'s loop body
+        raises AFTER a _DrainBarrier has been popped from the queue but BEFORE
+        the event was set, the per-iteration finally must STILL set the event.
+        Otherwise drain() would wait the full timeout against a dead consumer.
+
+        Deterministic: we inject a failure into _send_or_edit so the flush
+        triggered by the barrier raises. run() catches it in its outer handler
+        and returns; the finally must have set the barrier event first, so
+        drain() resolves promptly (well under its timeout) and the consumer
+        task completes."""
+        adapter = MagicMock()
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_1")
+        )
+        adapter.edit_message = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_1")
+        )
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5, cursor=" ▉")
+        consumer = GatewayStreamConsumer(adapter, "chat_123", config)
+
+        # Force the flush (triggered when the barrier is popped) to blow up,
+        # simulating an unhappy-path exception raised from within the loop body
+        # after the barrier was already popped.
+        async def _boom(*args, **kwargs):
+            raise RuntimeError("simulated flush failure after barrier pop")
+
+        consumer._send_or_edit = _boom  # type: ignore[assignment]
+
+        # Queued text guarantees should_edit triggers _send_or_edit on the
+        # barrier iteration (and thus _boom fires) rather than no-op flushing.
+        consumer.on_delta("preamble text before the card")
+
+        task = asyncio.create_task(consumer.run())
+        try:
+            start = asyncio.get_event_loop().time()
+            # drain() must resolve because the finally set the event, NOT
+            # because it timed out.
+            await consumer.drain(timeout=5.0)
+            elapsed = asyncio.get_event_loop().time() - start
+            assert elapsed < 2.0, (
+                f"drain() was not resolved by the loop's finally — it waited "
+                f"~{elapsed:.2f}s, implying the barrier was orphaned."
+            )
+        finally:
+            # run() should have already exited via its outer except handler.
+            consumer.finish()
+            await asyncio.wait_for(task, timeout=2.0)
+            assert task.done()
+
+
