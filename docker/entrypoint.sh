@@ -1,236 +1,27 @@
-#!/bin/bash
-# Docker/Podman entrypoint: bootstrap config files into the mounted volume, then run hermes.
-set -e
-
-HERMES_HOME="${HERMES_HOME:-/opt/data}"
-INSTALL_DIR="/opt/hermes"
-
-# --- Privilege dropping via gosu ---
-# When started as root (the default for Docker, or fakeroot in rootless Podman),
-# optionally remap the hermes user/group to match host-side ownership, fix volume
-# permissions, then re-exec as hermes.
-if [ "$(id -u)" = "0" ]; then
-    if [ -n "$HERMES_UID" ] && [ "$HERMES_UID" != "$(id -u hermes)" ]; then
-        echo "Changing hermes UID to $HERMES_UID"
-        usermod -u "$HERMES_UID" hermes
-    fi
-
-    if [ -n "$HERMES_GID" ] && [ "$HERMES_GID" != "$(id -g hermes)" ]; then
-        echo "Changing hermes GID to $HERMES_GID"
-        # -o allows non-unique GID (e.g. macOS GID 20 "staff" may already exist
-        # as "dialout" in the Debian-based container image)
-        groupmod -o -g "$HERMES_GID" hermes 2>/dev/null || true
-    fi
-
-    # Fix ownership of the data volume. When HERMES_UID remaps the hermes user,
-    # files created by previous runs (under the old UID) become inaccessible.
-    # Always chown -R when UID was remapped; otherwise only if top-level is wrong.
-    actual_hermes_uid=$(id -u hermes)
-    needs_chown=false
-    if [ -n "$HERMES_UID" ] && [ "$HERMES_UID" != "10000" ]; then
-        needs_chown=true
-    elif [ "$(stat -c %u "$HERMES_HOME" 2>/dev/null)" != "$actual_hermes_uid" ]; then
-        needs_chown=true
-    fi
-    if [ "$needs_chown" = true ]; then
-        echo "Fixing ownership of $HERMES_HOME to hermes ($actual_hermes_uid)"
-        # In rootless Podman the container's "root" is mapped to an unprivileged
-        # host UID — chown will fail.  That's fine: the volume is already owned
-        # by the mapped user on the host side.
-        chown -R hermes:hermes "$HERMES_HOME" 2>/dev/null || \
-            echo "Warning: chown failed (rootless container?) — continuing anyway"
-        # The .venv must also be re-chowned when UID is remapped, otherwise
-        # lazy_deps.py cannot install platform packages (discord.py, etc.).
-        chown -R hermes:hermes "$INSTALL_DIR/.venv" 2>/dev/null || \
-            echo "Warning: chown .venv failed (rootless container?) — continuing anyway"
-    fi
-
-    # Ensure config.yaml is readable by the hermes runtime user even if it was
-    # edited on the host after initial ownership setup. Must run here (as root)
-    # rather than after the gosu drop, otherwise a non-root caller like
-    # `docker run -u $(id -u):$(id -g)` hits "Operation not permitted" (#15865).
-    if [ -f "$HERMES_HOME/config.yaml" ]; then
-        chown hermes:hermes "$HERMES_HOME/config.yaml" 2>/dev/null || true
-        chmod 640 "$HERMES_HOME/config.yaml" 2>/dev/null || true
-    fi
-
-    # SOUL.md — admin-managed identity slot.  Overwritten on every boot from
-    # the image-baked copy so the hermes runtime user cannot drift it.  Owned
-    # by root and mode 0444 so even though the volume is hermes-writable, the
-    # file itself is not.  Personality customization is delegated to
-    # agent.personalities in config.yaml; SOUL.md only carries the breadcrumb
-    # pointing there.  Must run while still root (before the gosu drop) so
-    # the chown/chmod actually take effect.
-    if [ -f "$INSTALL_DIR/docker/SOUL.md" ]; then
-        cp "$INSTALL_DIR/docker/SOUL.md" "$HERMES_HOME/SOUL.md"
-        chown root:root "$HERMES_HOME/SOUL.md" 2>/dev/null || true
-        chmod 0444 "$HERMES_HOME/SOUL.md" 2>/dev/null || true
-    fi
-
-    # GitHub App PEM — admin-managed credential for outbound git/GitHub API
-    # auth (skills-hub private taps, gh CLI, raw `git clone`).  When
-    # GITHUB_APP_PEM_SECRET_ID is set, fetch the PEM from AWS Secrets
-    # Manager and drop it at GITHUB_APP_PEM_DEST_PATH (default
-    # /opt/data/secrets/github-app.pem) as hermes:hermes mode 0400.  Once
-    # in place, Hermes's built-in GitHubAuth._try_github_app() picks it up
-    # via GITHUB_APP_ID / GITHUB_APP_INSTALLATION_ID / GITHUB_APP_PRIVATE_KEY_PATH
-    # and mints installation tokens automatically.  Silent no-op when the
-    # secret-id env var is unset (generic deploys).  Crashes the boot on
-    # any error when set — a misconfigured pilot pod must crash-loop, not
-    # serve traffic without working GitHub auth.  Must run while still
-    # root (before the gosu drop) so the chown/chmod take effect.  Uses
-    # the venv's python because boto3 lives in the bedrock extra and the
-    # venv is not yet activated at this point.
-    if [ -f "$INSTALL_DIR/docker/install_github_app_pem.py" ]; then
-        "$INSTALL_DIR/.venv/bin/python3" "$INSTALL_DIR/docker/install_github_app_pem.py"
-    fi
-
-    echo "Dropping root privileges"
-    exec gosu hermes "$0" "$@"
-fi
-
-# --- Running as hermes from here ---
-source "${INSTALL_DIR}/.venv/bin/activate"
-
-# Stamp install method for detect_install_method()
-echo "docker" > "${HERMES_HOME:=/opt/data}/.install_method" 2>/dev/null || true
-
-# Create essential directory structure.  Cache and platform directories
-# (cache/images, cache/audio, platforms/whatsapp, etc.) are created on
-# demand by the application — don't pre-create them here so new installs
-# get the consolidated layout from get_hermes_dir().
-# The "home/" subdirectory is a per-profile HOME for subprocesses (git,
-# ssh, gh, npm …).  Without it those tools write to /root which is
-# ephemeral and shared across profiles.  See issue #4426.
-mkdir -p "$HERMES_HOME"/{cron,sessions,logs,hooks,memories,skills,skins,plans,workspace,home}
-
-# .env
-if [ ! -f "$HERMES_HOME/.env" ]; then
-    cp "$INSTALL_DIR/.env.example" "$HERMES_HOME/.env"
-fi
-
-# config.yaml
-if [ ! -f "$HERMES_HOME/config.yaml" ]; then
-    cp "$INSTALL_DIR/cli-config.yaml.example" "$HERMES_HOME/config.yaml"
-fi
-
-# Seed admin-managed bedrock guardrail config from env vars, if provided.
-# This is a SEED, not a lock — the user remains free to edit config.yaml.
-# Real enforcement that every Bedrock call carries the guardrail must come
-# from the IAM layer (bedrock:GuardrailIdentifier condition on the pod role).
-# Idempotent: skips the write when the file already matches env.  Safe to
-# run on every boot.  See docker/seed_admin_config.py for behavior details.
-if [ -f "$INSTALL_DIR/docker/seed_admin_config.py" ]; then
-    python3 "$INSTALL_DIR/docker/seed_admin_config.py" || \
-        echo "Warning: seed_admin_config.py exited non-zero — continuing"
-fi
-
-# Seed admin-managed skills-hub taps from HERMES_DEFAULT_TAPS, if provided.
-# Pairs with install_github_app_pem.py (the PEM provides outbound auth;
-# this registers the private repo(s) that use it) so the AmbulnzLLC pilot
-# (and any deployment shipping private skill repos) gets its shared
-# skills tap auto-registered without a post-deploy `hermes skills tap add`.
-# Format is comma- or newline-separated "owner/repo[@path]" or full URL.
-# This is a SEED, not a lock — the hermes user can `hermes skills tap
-# remove` afterwards; entries will be re-seeded on the next boot.
-# Idempotent: skips entries already in taps.json.  Silent no-op when the
-# env var is unset (generic deploys).  See docker/seed_taps.py for details.
-if [ -f "$INSTALL_DIR/docker/seed_taps.py" ]; then
-    python3 "$INSTALL_DIR/docker/seed_taps.py" || \
-        echo "Warning: seed_taps.py exited non-zero — continuing"
-fi
-
-# Seed admin-managed skill installs from HERMES_DEFAULT_SKILLS, if provided.
-# Pairs with seed_taps.py: that registers the private repo, this installs
-# specific skills from it (and any other source `hermes skills install`
-# accepts — well-known indexes, direct SKILL.md URLs, etc.) so the
-# AmbulnzLLC pilot's required skills are present on every pod immediately
-# after boot, instead of the operator running `hermes skills install` for
-# each one post-deploy.  Format is comma- or newline-separated identifiers
-# (e.g. `AmbulnzLLC/hermes-shared-skills/skills/data-engineering/airflow-dag`)
-# with an optional `@<name>` suffix for URL-sourced skills whose SKILL.md
-# lacks a `name:` frontmatter field.  This is a SEED, not a lock — the
-# hermes user can `hermes skills uninstall <name>` afterwards but the
-# skill will be re-installed on the next boot.  Idempotent: skills already
-# in lock.json are skipped.  Non-fatal: a single skill failing emits a
-# warning but boot continues; bad private-skill repos must NOT crash-loop
-# the pod and take chat down with it.  Silent no-op when the env var is
-# unset (generic deploys).  See docker/seed_skills.py for details.
-if [ -f "$INSTALL_DIR/docker/seed_skills.py" ]; then
-    python3 "$INSTALL_DIR/docker/seed_skills.py" || \
-        echo "Warning: seed_skills.py exited non-zero — continuing"
-fi
-
-# SOUL.md is provisioned in the root section above (root-owned, 0444), not here,
-# so the hermes user cannot rewrite it.
-
-# auth.json: bootstrap from env on first boot only.  Used by orchestrators
-# (e.g. provisioning a Hermes VPS from an account-management service) that
-# need to seed the OAuth refresh credential non-interactively, instead of
-# walking the user through `hermes setup` + the device-flow login dance.
-# Subsequent token rotations write back to the same file, which lives on a
-# persistent volume — so this env var is consumed exactly once at first
-# boot.  The `[ ! -f ... ]` guard is critical: without it, a container
-# restart would clobber a rotated refresh token with the now-stale value
-# the orchestrator originally seeded.
-if [ ! -f "$HERMES_HOME/auth.json" ] && [ -n "$HERMES_AUTH_JSON_BOOTSTRAP" ]; then
-    printf '%s' "$HERMES_AUTH_JSON_BOOTSTRAP" > "$HERMES_HOME/auth.json"
-    chmod 600 "$HERMES_HOME/auth.json"
-fi
-
-# Sync bundled skills (manifest-based so user edits are preserved)
-if [ -d "$INSTALL_DIR/skills" ]; then
-    python3 "$INSTALL_DIR/tools/skills_sync.py"
-fi
-
-# Optionally start `hermes dashboard` as a side-process.
+#!/bin/sh
+# s6-overlay shim. The real logic lives in docker/stage2-hook.sh, invoked
+# by /etc/cont-init.d/01-hermes-setup (installed by the Dockerfile). This
+# file exists so external references to docker/entrypoint.sh still work,
+# but it's no longer the ENTRYPOINT — /init is.
 #
-# Toggled by HERMES_DASHBOARD=1 (also accepts "true"/"yes", case-insensitive).
-# Host/port/TUI can be overridden via:
-#   HERMES_DASHBOARD_HOST  (default 0.0.0.0 — exposed outside the container)
-#   HERMES_DASHBOARD_PORT  (default 9119, matches `hermes dashboard` default)
-#   HERMES_DASHBOARD_TUI   (already honored by `hermes dashboard` itself)
+# When called directly (e.g. by an old wrapper script that hard-coded
+# docker/entrypoint.sh as the container ENTRYPOINT, or by an external
+# orchestration script that invokes it inside the container), forward to
+# the stage2 hook for parity with the pre-s6 entrypoint behavior. The
+# stage2 hook only handles cont-init bootstrap (UID remap, chown, config
+# seed, skills sync); it does NOT exec the CMD. Callers that depended
+# on the pre-s6 contract "entrypoint.sh sets up state then execs hermes"
+# will see the bootstrap happen but the CMD will not run from this shim.
 #
-# The dashboard is a long-lived server.  We background it *before* the final
-# `exec hermes "$@"` so the user's chosen foreground command (chat, gateway,
-# sleep infinity, …) remains PID-of-interest for the container runtime.  When
-# the container stops the whole process tree is torn down, so no explicit
-# cleanup is needed.
-case "${HERMES_DASHBOARD:-}" in
-    1|true|TRUE|True|yes|YES|Yes)
-        dash_host="${HERMES_DASHBOARD_HOST:-0.0.0.0}"
-        dash_port="${HERMES_DASHBOARD_PORT:-9119}"
-        dash_args=(--host "$dash_host" --port "$dash_port" --no-open)
-        # Binding to anything other than localhost requires --insecure — the
-        # dashboard refuses otherwise because it exposes API keys.  Inside a
-        # container this is the expected deployment (host reaches it via
-        # published port), so opt in automatically.
-        if [ "$dash_host" != "127.0.0.1" ] && [ "$dash_host" != "localhost" ]; then
-            dash_args+=(--insecure)
-        fi
-        echo "Starting hermes dashboard on ${dash_host}:${dash_port} (background)"
-        # Prefix dashboard output so it's distinguishable from the main
-        # process in `docker logs`.  stdbuf keeps the pipe line-buffered.
-        (
-            stdbuf -oL -eL hermes dashboard "${dash_args[@]}" 2>&1 \
-                | sed -u 's/^/[dashboard] /'
-        ) &
-        ;;
-esac
-
-# Final exec: two supported invocation patterns.
-#
-#   docker run <image>                 -> exec `hermes` with no args (legacy default)
-#   docker run <image> chat -q "..."   -> exec `hermes chat -q "..."` (legacy wrap)
-#   docker run <image> sleep infinity  -> exec `sleep infinity` directly
-#   docker run <image> bash            -> exec `bash` directly
-#
-# If the first positional arg resolves to an executable on PATH, we assume the
-# caller wants to run it directly (needed by the launcher which runs long-lived
-# `sleep infinity` sandbox containers — see tools/environments/docker.py).
-# Otherwise we treat the args as a hermes subcommand and wrap with `hermes`,
-# preserving the documented `docker run <image> <subcommand>` behavior.
-if [ $# -gt 0 ] && command -v "$1" >/dev/null 2>&1; then
-    exec "$@"
-fi
-exec hermes "$@"
+# Deprecation: this shim is preserved for one release cycle to give
+# downstream users time to migrate their wrappers to the image's real
+# ENTRYPOINT (`/init`). It will be removed in a future major release.
+# Surface a warning to stderr so anyone still invoking this path
+# sees the migration notice in their logs.
+echo "[hermes] WARNING: docker/entrypoint.sh is a deprecated shim under " \
+    "s6-overlay. The container's real ENTRYPOINT is /init + " \
+    "main-wrapper.sh; this script only runs the stage2 cont-init hook " \
+    "and does NOT exec the CMD. If you hard-coded docker/entrypoint.sh " \
+    "as your ENTRYPOINT, drop the override — docker will use the image's " \
+    "default ENTRYPOINT (/init), which handles bootstrap AND CMD." >&2
+exec /opt/hermes/docker/stage2-hook.sh "$@"
