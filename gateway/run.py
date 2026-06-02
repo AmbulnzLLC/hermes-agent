@@ -16949,6 +16949,23 @@ class GatewayRunner:
                 except Exception:
                     pass
 
+                # Ordering barrier: flush any assistant commentary still queued in the
+                # stream consumer so the clarify card never jumps ahead of the text that
+                # introduces it. Best-effort, bounded — never block the clarify path.
+                _sc = stream_consumer_holder[0]
+                if _sc is not None and hasattr(_sc, "drain"):
+                    try:
+                        _drain_fut = safe_schedule_threadsafe(
+                            _sc.drain(timeout=5.0),
+                            _loop_for_step,
+                            logger=logger,
+                            log_message="Clarify pre-flush drain failed to schedule",
+                        )
+                        if _drain_fut is not None:
+                            _drain_fut.result(timeout=6)  # slightly > drain's own timeout
+                    except Exception as exc:
+                        logger.debug("Clarify pre-flush drain skipped: %s", exc)
+
                 send_ok = False
                 fut = safe_schedule_threadsafe(
                     _status_adapter.send_clarify(
