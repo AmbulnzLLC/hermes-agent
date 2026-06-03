@@ -157,10 +157,19 @@ def test_main_installs_each_entry(hermes_home, monkeypatch, fake_do_install):
     assert mod.main() == 0
 
     assert fake_do_install.call_count == 2
-    # Verify both calls passed force=False, skip_confirm=True.
+    # Verify both calls passed force=True, skip_confirm=True.
+    #
+    # force=True is deliberate: HERMES_DEFAULT_SKILLS is the deployment
+    # admin's curated seed list (reviewed out-of-band), and the installer
+    # *refuses* to install a skill whose scanner verdict is ``caution`` /
+    # ``dangerous`` unless forced.  Org-shared skills like
+    # ``ambulnz-github-app-auth`` carry a ``caution`` verdict, so without
+    # force=True every fresh pod would boot missing them until an operator
+    # manually re-ran the install.  The dedup gate (_already_installed)
+    # ensures this only happens on genuine first install, not every boot.
     for call in fake_do_install.call_args_list:
         kwargs = call.kwargs
-        assert kwargs["force"] is False, "admin path must not bypass scans"
+        assert kwargs["force"] is True, "admin seed list bypasses scan verdicts"
         assert kwargs["skip_confirm"] is True, "boot is non-interactive"
 
 
@@ -230,6 +239,69 @@ def test_main_dedup_handles_trailing_slash(
     mod = _load_module()
     assert mod.main() == 0
     fake_do_install.assert_not_called()
+
+
+def test_main_dedup_handles_source_prefix(
+    hermes_home, lock_path, monkeypatch, fake_do_install
+):
+    """A bare env identifier matches a lockfile entry recorded with a source
+    prefix prepended by ``do_install``.
+
+    ``do_install`` routes a bare ``owner/repo/skills/<path>`` identifier
+    through whichever source resolves it (a tap, the skills.sh index, ...) and
+    records the *resolved* identifier — the env entry with a ``<source>/``
+    prefix.  Without prefix-tolerant dedup the seeder reinstalls (and
+    overwrites) the skill on every pod restart.  Regression test for that.
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "installed": {
+                    "ambulnz-github-app-auth": {
+                        "identifier": (
+                            "skills-sh/AmbulnzLLC/hermes-shared-skills"
+                            "/skills/github/ambulnz-github-app-auth"
+                        ),
+                        "install_path": "ambulnz-github-app-auth",
+                    }
+                },
+            }
+        )
+        + "\n"
+    )
+    monkeypatch.setenv(
+        "HERMES_DEFAULT_SKILLS",
+        "AmbulnzLLC/hermes-shared-skills/skills/github/ambulnz-github-app-auth",
+    )
+    mod = _load_module()
+    assert mod.main() == 0
+    fake_do_install.assert_not_called()
+
+
+def test_main_source_prefix_dedup_requires_boundary(
+    hermes_home, lock_path, monkeypatch, fake_do_install
+):
+    """Suffix matching must respect path-segment boundaries: a recorded
+    ``...xfoo/bar`` must NOT dedup an env entry ``foo/bar`` (no '/' boundary),
+    otherwise distinct skills sharing a tail would collide."""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text(
+        json.dumps(
+            {
+                "installed": {
+                    "bar": {"identifier": "skills-sh/notfoo/bar/skills/baz"}
+                }
+            }
+        )
+    )
+    # Env entry's tail ("foo/bar/skills/baz") is a substring of the recorded
+    # id but not on a '/' boundary (recorded has "notfoo", not "/foo").
+    monkeypatch.setenv("HERMES_DEFAULT_SKILLS", "foo/bar/skills/baz")
+    mod = _load_module()
+    assert mod.main() == 0
+    fake_do_install.assert_called_once()
 
 
 def test_main_continues_on_partial_failure(
