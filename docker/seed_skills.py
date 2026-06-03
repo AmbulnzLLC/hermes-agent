@@ -147,13 +147,36 @@ def _already_installed(identifier: str, lock_data: dict) -> bool:
     """Return True if any lock-file entry was sourced from this identifier.
 
     The hub records the resolved identifier alongside each install, so we
-    can dedup before re-running ``do_install``.  Trailing slashes are
-    stripped on both sides for comparison.
+    can dedup before re-running ``do_install``.
+
+    Matching is **source-prefix tolerant**.  ``do_install`` routes a bare
+    ``owner/repo/skills/<path>`` identifier through whichever source resolves
+    it (a registered tap, the ``skills.sh`` index, etc.) and records the
+    *resolved* identifier in ``lock.json`` — which is the original env entry
+    with a source prefix prepended, e.g.::
+
+        env entry  : AmbulnzLLC/hermes-shared-skills/skills/github/ambulnz-github-app-auth
+        recorded   : skills-sh/AmbulnzLLC/hermes-shared-skills/skills/github/ambulnz-github-app-auth
+
+    An exact ``==`` check never matches that pair, so the old dedup re-ran
+    ``do_install`` on **every** boot, clobbering the on-disk skill (and any
+    runtime state under it) each pod restart.  We therefore treat a recorded
+    identifier as a match when it equals the env identifier *or* ends with it
+    on a path-segment boundary (the prepended source prefix case).  Trailing
+    slashes are normalized on both sides.
     """
     needle = identifier.rstrip("/")
+    if not needle:
+        return False
     for entry in (lock_data.get("installed") or {}).values():
         recorded = str(entry.get("identifier", "")).rstrip("/")
-        if recorded and recorded == needle:
+        if not recorded:
+            continue
+        if recorded == needle:
+            return True
+        # Source-prefix tolerance: recorded is "<source>/<needle>".  Require a
+        # '/' boundary so "foo/bar" doesn't spuriously match "xfoo/bar".
+        if recorded.endswith("/" + needle):
             return True
     return False
 
