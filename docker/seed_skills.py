@@ -211,6 +211,76 @@ def _install_one(identifier: str, name_override: str) -> bool:
         return False
 
 
+def _skill_dir_for(identifier: str, name_override: str, lock_data: dict, skills_root: Path) -> Path:
+    """Best-effort resolve the on-disk directory a skill installed into.
+
+    Prefers the lockfile's recorded ``install_path`` (the bare skill name the
+    hub wrote, e.g. ``ambulnz-github-app-auth``) — matched prefix-tolerantly
+    against ``identifier`` the same way ``_already_installed`` matches.  Falls
+    back to ``name_override`` if given, else the trailing path segment of the
+    identifier.  All of these resolve under ``<skills_root>/<name>``.
+    """
+    needle = identifier.rstrip("/")
+    for entry in (lock_data.get("installed") or {}).values():
+        recorded = str(entry.get("identifier", "")).rstrip("/")
+        if not recorded:
+            continue
+        if recorded == needle or recorded.endswith("/" + needle):
+            install_path = str(entry.get("install_path", "")).strip()
+            if install_path:
+                return skills_root / install_path
+            break
+    if name_override:
+        return skills_root / name_override
+    # Trailing path segment of the identifier (strip any URL/query cruft).
+    tail = needle.rstrip("/").rsplit("/", 1)[-1]
+    tail = tail.split("?", 1)[0].split("#", 1)[0]
+    return skills_root / tail
+
+
+def _run_install_hook(skill_dir: Path) -> None:
+    """Run a skill's ``scripts/install.sh`` if it ships one.
+
+    Some skills need a post-install step that the file copy alone can't do —
+    e.g. ``ambulnz-github-app-auth`` symlinks its ``ambulnz-gh`` wrapper onto
+    PATH (``~/.local/bin``).  ``seed_skills`` copies the *files* every boot,
+    but the PATH symlink lives outside the skill dir, so on a fresh volume the
+    wrapper would be missing until someone ran the hook by hand.  Running the
+    hook here makes it self-heal on every boot.
+
+    Contract, mirroring the rest of the seeder:
+      * Best-effort and **non-fatal** — a failing hook warns but never crashes
+        the boot (the skill's own ``install.sh`` is expected to be idempotent).
+      * Invoked via ``bash`` (skill files are re-cert'd to ``-rw-r--r--`` on
+        deploy — no execute bit — so direct exec would fail).
+      * Inherits the current environment so ``$HOME`` is correct and the
+        wrapper lands in the login shell's ``$HOME/.local/bin``.
+    """
+    hook = skill_dir / "scripts" / "install.sh"
+    if not hook.is_file():
+        return
+    import subprocess
+
+    _log(f"running install hook: {hook}")
+    try:
+        proc = subprocess.run(
+            ["bash", str(hook)],
+            cwd=str(skill_dir),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        _err(f"install hook {hook} could not run: {exc}")
+        return
+    for line in (proc.stdout or "").splitlines():
+        _log(f"  hook: {line}")
+    if proc.returncode != 0:
+        _err(f"install hook {hook} exited {proc.returncode}")
+        for line in (proc.stderr or "").splitlines():
+            _err(f"  hook: {line}")
+
+
 def main() -> int:
     raw = os.environ.get("HERMES_DEFAULT_SKILLS", "").strip()
     if not raw:
@@ -242,16 +312,27 @@ def main() -> int:
     installed_count = 0
     skipped_count = 0
     failed_count = 0
+    skills_root = home / "skills"
 
     for identifier, name_override in parsed:
         if _already_installed(identifier, lock_data):
             skipped_count += 1
             _log(f"already installed: {identifier}")
+            # Still run the install hook: file-copy idempotence doesn't cover
+            # side effects outside the skill dir (e.g. the ~/.local/bin
+            # wrapper symlink), which can be absent on a fresh volume even
+            # when the skill files are present.  The hook is idempotent.
+            _run_install_hook(
+                _skill_dir_for(identifier, name_override, lock_data, skills_root)
+            )
             continue
 
         _log(f"installing {identifier}" + (f" (name={name_override})" if name_override else ""))
         if _install_one(identifier, name_override):
             installed_count += 1
+            _run_install_hook(
+                _skill_dir_for(identifier, name_override, lock_data, skills_root)
+            )
         else:
             failed_count += 1
 

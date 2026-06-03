@@ -6,10 +6,14 @@ listed in ``HERMES_DEFAULT_SKILLS``.  Its contract:
 - Silent no-op when ``HERMES_DEFAULT_SKILLS`` is unset/empty (generic
   deploys).
 - Each entry is fed to ``hermes_cli.skills_hub.do_install`` with
-  ``skip_confirm=True`` and ``force=False`` (admin-baked path must NOT
-  bypass scan verdicts).
+  ``skip_confirm=True`` and ``force=True`` (the admin-baked path must
+  proceed past ``caution`` scan verdicts; the dedup gate ahead of it
+  ensures ``force`` only fires on a genuine first install).
 - Idempotent: skills already recorded in ``lock.json`` (matched by
-  ``identifier`` field) are skipped without invoking the installer.
+  ``identifier`` field, prefix-tolerantly) are skipped without invoking
+  the installer.  A skill's ``scripts/install.sh`` post-install hook,
+  however, still runs on the skip path (it self-heals side effects that
+  live outside the skill dir, e.g. a ``~/.local/bin`` wrapper symlink).
 - Non-fatal: a single failed install emits a warning but the script
   exits 0 so boot continues.  A bad private-skill repo must not
   crash-loop the pod.
@@ -365,3 +369,129 @@ def test_main_handles_malformed_lockfile(
     fake_do_install.assert_called_once()
     err = capsys.readouterr().err
     assert "could not read" in err
+
+
+# ---------------------------------------------------------------------------
+# Install hooks (scripts/install.sh)
+# ---------------------------------------------------------------------------
+
+
+def _make_skill_with_hook(skills_root: Path, name: str, body: str) -> Path:
+    """Create <skills_root>/<name>/scripts/install.sh with the given body."""
+    skill_dir = skills_root / name
+    (skill_dir / "scripts").mkdir(parents=True, exist_ok=True)
+    hook = skill_dir / "scripts" / "install.sh"
+    hook.write_text("#!/usr/bin/env bash\n" + body)
+    return skill_dir
+
+
+def test_run_install_hook_noop_when_absent(hermes_home):
+    """A skill with no scripts/install.sh is a silent no-op."""
+    mod = _load_module()
+    skill_dir = hermes_home / "skills" / "no-hook"
+    skill_dir.mkdir(parents=True)
+    mod._run_install_hook(skill_dir)  # must not raise
+
+
+def test_run_install_hook_runs_and_inherits_env(hermes_home, tmp_path, monkeypatch):
+    """Present hook is executed via bash and inherits the env (e.g. so it can
+    write to a $HOME-derived path)."""
+    mod = _load_module()
+    skills_root = hermes_home / "skills"
+    marker = tmp_path / "hook-ran"
+    skill_dir = _make_skill_with_hook(
+        skills_root, "with-hook", 'echo ok; : > "$HOOK_MARKER"\n'
+    )
+    monkeypatch.setenv("HOOK_MARKER", str(marker))
+    mod._run_install_hook(skill_dir)
+    assert marker.exists(), "hook should have run and inherited HOOK_MARKER from env"
+
+
+def test_run_install_hook_nonfatal_on_failure(hermes_home, capsys):
+    """A hook that exits non-zero warns but does not raise."""
+    mod = _load_module()
+    skills_root = hermes_home / "skills"
+    skill_dir = _make_skill_with_hook(skills_root, "bad-hook", "echo boom >&2; exit 3\n")
+    mod._run_install_hook(skill_dir)  # must not raise
+    err = capsys.readouterr().err
+    assert "exited 3" in err
+    assert "boom" in err
+
+
+def test_skill_dir_for_uses_lock_install_path():
+    """Resolution prefers the lockfile's recorded install_path, matched
+    prefix-tolerantly against the source-prefixed identifier."""
+    mod = _load_module()
+    lock_data = {
+        "installed": {
+            "k": {
+                "identifier": "skills-sh/AmbulnzLLC/hermes-shared-skills/skills/github/ambulnz-github-app-auth",
+                "install_path": "ambulnz-github-app-auth",
+            }
+        }
+    }
+    root = Path("/skills")
+    got = mod._skill_dir_for(
+        "AmbulnzLLC/hermes-shared-skills/skills/github/ambulnz-github-app-auth",
+        "",
+        lock_data,
+        root,
+    )
+    assert got == root / "ambulnz-github-app-auth"
+
+
+def test_skill_dir_for_falls_back_to_name_override():
+    mod = _load_module()
+    root = Path("/skills")
+    got = mod._skill_dir_for("https://example.com/x/SKILL.md", "my-skill", {}, root)
+    assert got == root / "my-skill"
+
+
+def test_skill_dir_for_falls_back_to_identifier_tail():
+    mod = _load_module()
+    root = Path("/skills")
+    got = mod._skill_dir_for("foo/bar/skills/baz", "", {"installed": {}}, root)
+    assert got == root / "baz"
+
+
+def test_main_runs_hook_on_install(hermes_home, monkeypatch, fake_do_install):
+    """After a fresh install, the skill's install.sh runs."""
+    mod = _load_module()
+    skills_root = hermes_home / "skills"
+    marker = hermes_home / "installed-marker"
+    # do_install is faked, so we materialize the skill dir + hook ourselves to
+    # stand in for what the real installer would have written.
+    _make_skill_with_hook(skills_root, "baz", f': > "{marker}"\n')
+    monkeypatch.setenv("HERMES_DEFAULT_SKILLS", "foo/bar/skills/baz")
+    assert mod.main() == 0
+    fake_do_install.assert_called_once()
+    assert marker.exists(), "install hook should run on the install path"
+
+
+def test_main_runs_hook_on_skip(hermes_home, lock_path, monkeypatch, fake_do_install):
+    """Even when the skill is already installed (skipped), the hook still runs
+    — the PATH symlink can be missing on a fresh volume."""
+    mod = _load_module()
+    skills_root = hermes_home / "skills"
+    marker = hermes_home / "skip-marker"
+    _make_skill_with_hook(skills_root, "ambulnz-github-app-auth", f': > "{marker}"\n')
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text(
+        json.dumps(
+            {
+                "installed": {
+                    "k": {
+                        "identifier": "skills-sh/AmbulnzLLC/hermes-shared-skills/skills/github/ambulnz-github-app-auth",
+                        "install_path": "ambulnz-github-app-auth",
+                    }
+                }
+            }
+        )
+    )
+    monkeypatch.setenv(
+        "HERMES_DEFAULT_SKILLS",
+        "AmbulnzLLC/hermes-shared-skills/skills/github/ambulnz-github-app-auth",
+    )
+    assert mod.main() == 0
+    fake_do_install.assert_not_called()  # was skipped (already installed via dedup)
+    assert marker.exists(), "install hook should run even on the skip path"
