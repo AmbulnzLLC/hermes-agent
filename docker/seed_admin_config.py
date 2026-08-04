@@ -1,67 +1,46 @@
-"""Seed admin-managed config keys at container boot.
+"""Seed the admin-managed config overlay at container boot.
 
-Reads admin-controlled env vars and writes them into ``$HERMES_HOME/config.yaml``.
 Designed for pilot/multi-tenant container deployments where the operator
-provisions identity / model selection via Kubernetes injection rather than
-baking it into the image.
+provisions config (identity, model selection, guardrails, and anything else)
+via Kubernetes injection rather than baking it into the image.
 
-Currently seeds:
-- ``bedrock.guardrail.*`` from BEDROCK_GUARDRAIL_ID / BEDROCK_GUARDRAIL_VERSION
-  / BEDROCK_GUARDRAIL_TRACE.
-- top-level ``model`` from HERMES_MODEL.
-- an arbitrary operator-supplied overlay deep-merged from the YAML file at
-  ``HERMES_ADMIN_CONFIG_OVERLAY`` (default ``/config/overlay.yaml``).  This is
-  the generic escape hatch: operators (e.g. the hermes-eks Helm chart) can pin
-  *any* config key by mounting an overlay ConfigMap, with no code change here.
+The mechanism is a single generic overlay:
 
-Behavior — guardrail:
-- BEDROCK_GUARDRAIL_ID and BEDROCK_GUARDRAIL_VERSION must both be set and
-  non-empty; otherwise the guardrail block is a no-op (no trace seeding either).
-- BEDROCK_GUARDRAIL_TRACE is optional.  When set, it must be one of
-  ``ENABLED``, ``ENABLED_FULL``, ``DISABLED`` (case-insensitive — normalized
-  to upper-case on write).  Anything else is rejected with a non-zero exit
-  so misconfigurations crash-loop rather than silently disabling tracing.
-
-Behavior — model:
-- HERMES_MODEL is optional.  When set and non-empty, the top-level ``model``
-  key is overwritten with its value on every boot — admin wins, matching the
-  guardrail mental model where Helm chart values are the source of truth.
-- If the existing config.yaml already has a ``model`` value that differs from
-  HERMES_MODEL, the script logs a WARNING (visible in the init-container
-  output) before overwriting, so a user who did ``hermes config set model X``
-  inside the pod has a breadcrumb explaining why their choice didn't survive
-  the next restart.
-- The key is always written as a top-level string (``model: <id>``), matching
-  the shape produced by the Helm configmap.  Hermes itself also accepts the
-  dict shape ``model: {default: <id>}`` (see cli.py); if config.yaml already
-  has the dict shape, this script overwrites the ``default`` leaf and leaves
-  sibling keys alone.
-
-Behavior — overlay:
 - ``HERMES_ADMIN_CONFIG_OVERLAY`` names a YAML file (default
-  ``/config/overlay.yaml``).  If the file is absent or empty, the overlay step
-  is a silent no-op.
-- When present, its top-level mapping is **recursively deep-merged** over the
-  existing config: nested mappings merge key-by-key; scalars, lists, and
-  ``None`` in the overlay REPLACE whatever is at that path (lists are not
-  concatenated).  The overlay is unrestricted — it can set any key.
-- The overlay is applied AFTER the guardrail/model seeders, so an overlay entry
-  wins over those when they touch the same path.  In practice keep the two
-  mechanisms disjoint; the explicit seeders remain for backward-compat.
+  ``/config/overlay.yaml``), typically projected from a Helm-managed ConfigMap.
+- On every boot its top-level mapping is **recursively deep-merged** into
+  ``$HERMES_HOME/config.yaml``: nested mappings merge key-by-key; scalars,
+  lists, and ``None`` REPLACE whatever is at that path (lists are not
+  concatenated).  The overlay is unrestricted — it can pin *any* config key,
+  so adding a new admin-controlled setting needs no code change here.
+- Absent/empty overlay file → silent no-op (generic, non-pilot deploys).
 - A non-mapping or unparseable overlay file is logged and skipped (fail-open) —
-  it does not clobber a working config.yaml.
+  it never clobbers a working config.yaml.
+
+History: this script used to carry dedicated ``_seed_model`` /
+``_seed_guardrail`` helpers driven by ``HERMES_MODEL`` / ``BEDROCK_GUARDRAIL_*``
+env vars.  Those were folded into the generic overlay — the hermes-eks chart
+now templates ``model`` and ``bedrock.guardrail.*`` into the overlay ConfigMap
+directly, so there is a single source of truth for admin config.
+
+Compliance guarantee preserved across the migration:
+- ``bedrock.guardrail.trace``, when present in the merged config, must be one of
+  ``ENABLED``, ``ENABLED_FULL``, ``DISABLED`` (case-insensitive; normalized to
+  upper-case on write).  Anything else is rejected with a non-zero exit so a
+  misconfigured guardrail crash-loops rather than silently disabling tracing.
+  This validation is now source-agnostic: it fires whether the trace value came
+  from the overlay or was already on disk.
 
 General:
-- Runs on every container boot.  Idempotent when env values already match.
-- Preserves all other keys in config.yaml — only the keys above are touched.
-  ``setdefault`` is used at every level so adjacent keys (e.g. ``bedrock.region``,
-  top-level ``approvals``) are left untouched.
+- Runs on every container boot.  Idempotent when the merged result already
+  matches disk (no mtime churn → keeps ``load_config()``'s cache warm).
+- Preserves all keys in config.yaml that the overlay does not touch.
 - Fails open: a pre-existing YAML parse error in config.yaml causes this
   script to log and exit 0 rather than clobbering the broken file.
 
-This is a SEED, not a lock.  The user can subsequently edit, blank, or
-remove these values via ``hermes config set`` or by editing config.yaml
-directly; they will be re-seeded on the next container boot.  For guardrail
+This is a SEED, not a lock.  A user can subsequently edit, blank, or remove
+these values via ``hermes config set`` or by editing config.yaml directly; the
+overlay re-applies on the next container boot (admin/Helm wins).  For guardrail
 specifically, the actual enforcement that every Bedrock call carries the
 guardrail must come from the IAM layer (``bedrock:GuardrailIdentifier``
 condition keys on the role the pod assumes), not from this file.
@@ -77,6 +56,8 @@ import yaml
 
 
 _DEFAULT_OVERLAY_PATH = "/config/overlay.yaml"
+
+_VALID_GUARDRAIL_TRACE = {"ENABLED", "ENABLED_FULL", "DISABLED"}
 
 
 def _deep_merge(base: dict, overlay: dict) -> None:
@@ -105,8 +86,9 @@ def _apply_overlay(cfg: dict) -> int:
     unparseable overlay is logged and skipped (fail-open).
 
     Returns 0 always — a malformed overlay must not crash the boot; it just
-    doesn't apply.  (Contrast the guardrail path, where a bad trace value is
-    compliance-critical and does crash.)
+    doesn't apply.  (Compliance-critical validation of specific merged values,
+    e.g. the guardrail trace, happens separately in ``_validate_guardrail_trace``
+    so it fires regardless of where the value came from.)
     """
     overlay_path = Path(
         os.environ.get("HERMES_ADMIN_CONFIG_OVERLAY", _DEFAULT_OVERLAY_PATH)
@@ -139,108 +121,42 @@ def _apply_overlay(cfg: dict) -> int:
     return 0
 
 
-def _seed_guardrail(cfg: dict) -> int:
-    """Apply BEDROCK_GUARDRAIL_* env into ``cfg`` in place.
+def _validate_guardrail_trace(cfg: dict) -> int:
+    """Validate + normalize ``bedrock.guardrail.trace`` in the merged config.
 
-    Returns 0 on success/no-op, 1 if BEDROCK_GUARDRAIL_TRACE is invalid.
-    Mutates ``cfg`` only when env is set; returns silently otherwise.
+    Compliance-critical: guardrail trace observability must not be silently
+    disabled by a typo.  Runs after the overlay merge, so it validates the
+    effective value regardless of source (overlay or pre-existing on disk).
+
+    - No bedrock/guardrail block, or no ``trace`` key → no-op (returns 0).
+    - A valid value (case-insensitive) is normalized to upper-case in place.
+    - Anything else → ERROR + return 1 so the pod crash-loops.
     """
-    guardrail_id = os.environ.get("BEDROCK_GUARDRAIL_ID", "").strip()
-    guardrail_version = os.environ.get("BEDROCK_GUARDRAIL_VERSION", "").strip()
-    guardrail_trace_raw = os.environ.get("BEDROCK_GUARDRAIL_TRACE", "").strip()
-
-    if not (guardrail_id and guardrail_version):
-        # Nothing to seed — this image build / deployment doesn't pin a
-        # guardrail.  Silent no-op so generic (non-pilot) deploys aren't
-        # noisy.
-        return 0
-
-    guardrail_trace: str | None = None
-    if guardrail_trace_raw:
-        normalized = guardrail_trace_raw.upper()
-        valid = {"ENABLED", "ENABLED_FULL", "DISABLED"}
-        if normalized not in valid:
-            print(
-                f"[seed_admin_config] ERROR: BEDROCK_GUARDRAIL_TRACE={guardrail_trace_raw!r} "
-                f"is not one of {sorted(valid)}; refusing to boot",
-                file=sys.stderr,
-            )
-            return 1
-        guardrail_trace = normalized
-
-    bedrock = cfg.setdefault("bedrock", {})
+    bedrock = cfg.get("bedrock")
     if not isinstance(bedrock, dict):
-        print(
-            f"[seed_admin_config] WARNING: bedrock key in config.yaml is not a "
-            f"mapping (got {type(bedrock).__name__}); skipping guardrail seed",
-            file=sys.stderr,
-        )
         return 0
-
-    guardrail = bedrock.setdefault("guardrail", {})
+    guardrail = bedrock.get("guardrail")
     if not isinstance(guardrail, dict):
+        return 0
+    if "trace" not in guardrail:
+        return 0
+
+    raw = guardrail["trace"]
+    if raw is None:
+        # Explicit null — treat as "no trace"; drop the key so the transport
+        # falls back to its no-trace default rather than carrying a stale value.
+        del guardrail["trace"]
+        return 0
+
+    normalized = str(raw).strip().upper()
+    if normalized not in _VALID_GUARDRAIL_TRACE:
         print(
-            f"[seed_admin_config] WARNING: bedrock.guardrail in config.yaml is not "
-            f"a mapping (got {type(guardrail).__name__}); skipping guardrail seed",
+            f"[seed_admin_config] ERROR: bedrock.guardrail.trace={raw!r} is not "
+            f"one of {sorted(_VALID_GUARDRAIL_TRACE)}; refusing to boot",
             file=sys.stderr,
         )
-        return 0
-
-    guardrail["guardrail_identifier"] = guardrail_id
-    guardrail["guardrail_version"] = guardrail_version
-    if guardrail_trace is not None:
-        guardrail["trace"] = guardrail_trace
-    elif "trace" in guardrail:
-        # Operator removed BEDROCK_GUARDRAIL_TRACE — clear the seeded value
-        # so the transport falls back to its no-trace default rather than
-        # carrying a stale setting forward.
-        del guardrail["trace"]
-
-    return 0
-
-
-def _seed_model(cfg: dict) -> int:
-    """Apply HERMES_MODEL env into ``cfg`` in place.
-
-    HERMES_MODEL is optional.  When set, the top-level ``model`` key is
-    overwritten — admin wins.  If the existing value differs, log a WARNING
-    so users who edited it inside the pod have a breadcrumb.
-
-    Returns 0 always (model misconfig is not fatal — guardrail compliance
-    is the only crash-on-error case).
-    """
-    model = os.environ.get("HERMES_MODEL", "").strip()
-    if not model:
-        return 0
-
-    existing = cfg.get("model")
-    if isinstance(existing, dict):
-        # User (or a previous Hermes write) chose the dict shape.  Update the
-        # ``default`` leaf and leave siblings (``base_url``, ``provider``,
-        # etc.) intact rather than collapsing the structure.
-        prior = existing.get("default")
-        if prior and prior != model:
-            print(
-                f"[seed_admin_config] WARNING: model.default in config.yaml "
-                f"({prior!r}) differs from HERMES_MODEL ({model!r}); admin "
-                f"value wins.  If a user changed it via 'hermes config set "
-                f"model', that change won't survive a restart — update Helm "
-                f"values instead.",
-                file=sys.stderr,
-            )
-        existing["default"] = model
-    else:
-        # String shape (matches Helm configmap) or unset.
-        if existing and existing != model:
-            print(
-                f"[seed_admin_config] WARNING: model in config.yaml ({existing!r}) "
-                f"differs from HERMES_MODEL ({model!r}); admin value wins.  If "
-                f"a user changed it via 'hermes config set model', that change "
-                f"won't survive a restart — update Helm values instead.",
-                file=sys.stderr,
-            )
-        cfg["model"] = model
-
+        return 1
+    guardrail["trace"] = normalized
     return 0
 
 
@@ -248,19 +164,12 @@ def main() -> int:
     home = Path(os.environ.get("HERMES_HOME", "/opt/data"))
     config_path = home / "config.yaml"
 
-    # Quick check: if no admin env is set at all AND no overlay file exists,
-    # this is a generic (non-pilot) deploy.  Silent no-op so we don't churn
-    # config.yaml or log noise.
-    has_guardrail_env = bool(
-        os.environ.get("BEDROCK_GUARDRAIL_ID", "").strip()
-        and os.environ.get("BEDROCK_GUARDRAIL_VERSION", "").strip()
-    )
-    has_model_env = bool(os.environ.get("HERMES_MODEL", "").strip())
+    # Quick check: if no overlay file exists, this is a generic (non-pilot)
+    # deploy.  Silent no-op so we don't churn config.yaml or log noise.
     overlay_path = Path(
         os.environ.get("HERMES_ADMIN_CONFIG_OVERLAY", _DEFAULT_OVERLAY_PATH)
     )
-    has_overlay = overlay_path.exists()
-    if not (has_guardrail_env or has_model_env or has_overlay):
+    if not overlay_path.exists():
         return 0
 
     cfg: dict = {}
@@ -290,31 +199,25 @@ def main() -> int:
     # ``load_config()``'s in-process cache on every restart for no reason.
     before = copy.deepcopy(cfg)
 
-    rc = _seed_guardrail(cfg)
-    if rc != 0:
-        return rc
-
-    rc = _seed_model(cfg)
-    if rc != 0:
-        return rc
-
-    # Generic operator overlay — applied last so it can layer arbitrary keys
-    # over (and win against) the explicit seeders above.  Fail-open: a bad
-    # overlay is skipped, never crashes the boot.
     rc = _apply_overlay(cfg)
+    if rc != 0:
+        return rc
+
+    # Compliance-critical post-merge validation.  Source-agnostic: fires on the
+    # effective guardrail trace whether it came from the overlay or from disk.
+    rc = _validate_guardrail_trace(cfg)
     if rc != 0:
         return rc
 
     if cfg == before:
         print(
-            f"[seed_admin_config] config.yaml already matches admin env; no write"
+            f"[seed_admin_config] config.yaml already matches overlay; no write"
         )
         return 0
 
     config_path.write_text(yaml.safe_dump(cfg, sort_keys=False))
 
-    # Log what landed.  Use post-state to avoid leaking env values that
-    # weren't actually applied (e.g. when guardrail block was rejected).
+    # Log what landed.  Use post-state so we report the effective values.
     summary_parts = []
     g = cfg.get("bedrock", {}).get("guardrail", {}) if isinstance(cfg.get("bedrock"), dict) else {}
     if g.get("guardrail_identifier"):
@@ -329,7 +232,7 @@ def main() -> int:
     elif m:
         summary_parts.append(f"model={m!r}")
     print(
-        f"[seed_admin_config] wrote {config_path}: {', '.join(summary_parts) or '(no changes)'}"
+        f"[seed_admin_config] wrote {config_path}: {', '.join(summary_parts) or '(overlay applied)'}"
     )
     return 0
 
