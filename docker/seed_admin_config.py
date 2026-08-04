@@ -9,6 +9,10 @@ Currently seeds:
 - ``bedrock.guardrail.*`` from BEDROCK_GUARDRAIL_ID / BEDROCK_GUARDRAIL_VERSION
   / BEDROCK_GUARDRAIL_TRACE.
 - top-level ``model`` from HERMES_MODEL.
+- an arbitrary operator-supplied overlay deep-merged from the YAML file at
+  ``HERMES_ADMIN_CONFIG_OVERLAY`` (default ``/config/overlay.yaml``).  This is
+  the generic escape hatch: operators (e.g. the hermes-eks Helm chart) can pin
+  *any* config key by mounting an overlay ConfigMap, with no code change here.
 
 Behavior — guardrail:
 - BEDROCK_GUARDRAIL_ID and BEDROCK_GUARDRAIL_VERSION must both be set and
@@ -33,6 +37,20 @@ Behavior — model:
   has the dict shape, this script overwrites the ``default`` leaf and leaves
   sibling keys alone.
 
+Behavior — overlay:
+- ``HERMES_ADMIN_CONFIG_OVERLAY`` names a YAML file (default
+  ``/config/overlay.yaml``).  If the file is absent or empty, the overlay step
+  is a silent no-op.
+- When present, its top-level mapping is **recursively deep-merged** over the
+  existing config: nested mappings merge key-by-key; scalars, lists, and
+  ``None`` in the overlay REPLACE whatever is at that path (lists are not
+  concatenated).  The overlay is unrestricted — it can set any key.
+- The overlay is applied AFTER the guardrail/model seeders, so an overlay entry
+  wins over those when they touch the same path.  In practice keep the two
+  mechanisms disjoint; the explicit seeders remain for backward-compat.
+- A non-mapping or unparseable overlay file is logged and skipped (fail-open) —
+  it does not clobber a working config.yaml.
+
 General:
 - Runs on every container boot.  Idempotent when env values already match.
 - Preserves all other keys in config.yaml — only the keys above are touched.
@@ -56,6 +74,69 @@ import sys
 from pathlib import Path
 
 import yaml
+
+
+_DEFAULT_OVERLAY_PATH = "/config/overlay.yaml"
+
+
+def _deep_merge(base: dict, overlay: dict) -> None:
+    """Recursively merge ``overlay`` into ``base`` in place.
+
+    Semantics:
+    - When both sides hold a mapping at the same key, recurse.
+    - Otherwise the overlay value REPLACES the base value.  This covers
+      scalars, lists (no concatenation — the overlay list wins whole), and
+      ``None`` (an explicit null in the overlay overwrites, letting an operator
+      blank a key).
+    """
+    for key, ov in overlay.items():
+        cur = base.get(key)
+        if isinstance(cur, dict) and isinstance(ov, dict):
+            _deep_merge(cur, ov)
+        else:
+            base[key] = ov
+
+
+def _apply_overlay(cfg: dict) -> int:
+    """Deep-merge the operator overlay file into ``cfg`` in place.
+
+    Reads the YAML file named by ``HERMES_ADMIN_CONFIG_OVERLAY`` (default
+    ``/config/overlay.yaml``).  Absent/empty file → no-op.  A non-mapping or
+    unparseable overlay is logged and skipped (fail-open).
+
+    Returns 0 always — a malformed overlay must not crash the boot; it just
+    doesn't apply.  (Contrast the guardrail path, where a bad trace value is
+    compliance-critical and does crash.)
+    """
+    overlay_path = Path(
+        os.environ.get("HERMES_ADMIN_CONFIG_OVERLAY", _DEFAULT_OVERLAY_PATH)
+    )
+    if not overlay_path.exists():
+        return 0
+
+    try:
+        loaded = yaml.safe_load(overlay_path.read_text())
+    except yaml.YAMLError as exc:
+        print(
+            f"[seed_admin_config] WARNING: overlay {overlay_path} parse failed "
+            f"({exc}); skipping overlay",
+            file=sys.stderr,
+        )
+        return 0
+
+    if loaded is None:
+        # Empty file — nothing to merge.
+        return 0
+    if not isinstance(loaded, dict):
+        print(
+            f"[seed_admin_config] WARNING: overlay {overlay_path} did not parse "
+            f"as a mapping (got {type(loaded).__name__}); skipping overlay",
+            file=sys.stderr,
+        )
+        return 0
+
+    _deep_merge(cfg, loaded)
+    return 0
 
 
 def _seed_guardrail(cfg: dict) -> int:
@@ -167,14 +248,19 @@ def main() -> int:
     home = Path(os.environ.get("HERMES_HOME", "/opt/data"))
     config_path = home / "config.yaml"
 
-    # Quick check: if no admin env is set at all, this is a generic (non-pilot)
-    # deploy.  Silent no-op so we don't churn config.yaml or log noise.
+    # Quick check: if no admin env is set at all AND no overlay file exists,
+    # this is a generic (non-pilot) deploy.  Silent no-op so we don't churn
+    # config.yaml or log noise.
     has_guardrail_env = bool(
         os.environ.get("BEDROCK_GUARDRAIL_ID", "").strip()
         and os.environ.get("BEDROCK_GUARDRAIL_VERSION", "").strip()
     )
     has_model_env = bool(os.environ.get("HERMES_MODEL", "").strip())
-    if not (has_guardrail_env or has_model_env):
+    overlay_path = Path(
+        os.environ.get("HERMES_ADMIN_CONFIG_OVERLAY", _DEFAULT_OVERLAY_PATH)
+    )
+    has_overlay = overlay_path.exists()
+    if not (has_guardrail_env or has_model_env or has_overlay):
         return 0
 
     cfg: dict = {}
@@ -209,6 +295,13 @@ def main() -> int:
         return rc
 
     rc = _seed_model(cfg)
+    if rc != 0:
+        return rc
+
+    # Generic operator overlay — applied last so it can layer arbitrary keys
+    # over (and win against) the explicit seeders above.  Fail-open: a bad
+    # overlay is skipped, never crashes the boot.
+    rc = _apply_overlay(cfg)
     if rc != 0:
         return rc
 

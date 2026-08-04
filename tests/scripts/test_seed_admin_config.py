@@ -41,6 +41,12 @@ def _load_module():
 @pytest.fixture
 def hermes_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    # Default overlay to a path under tmp that does not exist, so tests are
+    # hermetic against any real /config/overlay.yaml on the host/CI runner.
+    # Overlay-specific tests override this env to point at a file they create.
+    monkeypatch.setenv(
+        "HERMES_ADMIN_CONFIG_OVERLAY", str(tmp_path / "no-such-overlay.yaml")
+    )
     return tmp_path
 
 
@@ -51,6 +57,7 @@ def clean_env(monkeypatch):
         "BEDROCK_GUARDRAIL_VERSION",
         "BEDROCK_GUARDRAIL_TRACE",
         "HERMES_MODEL",
+        "HERMES_ADMIN_CONFIG_OVERLAY",
     ):
         monkeypatch.delenv(var, raising=False)
     return monkeypatch
@@ -385,3 +392,196 @@ def test_hermes_model_alone_does_not_create_bedrock_block(
 
     cfg = _read_cfg(hermes_home)
     assert "bedrock" not in cfg
+
+
+# ─── generic overlay deep-merge ─────────────────────────────────────────────
+
+
+def _write_overlay(home: Path, monkeypatch, data) -> Path:
+    """Write an overlay file under ``home`` and point the env at it.
+
+    ``data`` may be a dict (dumped to YAML) or a raw string (written verbatim,
+    for malformed-YAML cases).
+    """
+    p = home / "overlay.yaml"
+    if isinstance(data, str):
+        p.write_text(data)
+    else:
+        p.write_text(yaml.safe_dump(data))
+    monkeypatch.setenv("HERMES_ADMIN_CONFIG_OVERLAY", str(p))
+    return p
+
+
+def test_overlay_absent_is_noop(hermes_home, clean_env, monkeypatch):
+    """No overlay file, no other admin env → silent no-op, no file written."""
+    monkeypatch.setenv(
+        "HERMES_ADMIN_CONFIG_OVERLAY", str(hermes_home / "does-not-exist.yaml")
+    )
+    mod = _load_module()
+    assert mod.main() == 0
+    assert not (hermes_home / "config.yaml").exists()
+
+
+def test_overlay_seeds_arbitrary_keys_from_scratch(
+    hermes_home, clean_env, monkeypatch
+):
+    """Overlay alone (no guardrail/model env) can create config from nothing."""
+    _write_overlay(
+        hermes_home,
+        monkeypatch,
+        {
+            "platforms": {"teams": {"typing_indicator": False}},
+            "some_new_top_level": {"nested": {"value": 42}},
+        },
+    )
+    mod = _load_module()
+    assert mod.main() == 0
+
+    cfg = _read_cfg(hermes_home)
+    assert cfg["platforms"]["teams"]["typing_indicator"] is False
+    assert cfg["some_new_top_level"]["nested"]["value"] == 42
+
+
+def test_overlay_deep_merges_preserving_siblings(
+    hermes_home, clean_env, monkeypatch
+):
+    """Nested overlay merges key-by-key; adjacent keys survive."""
+    cfg_path = hermes_home / "config.yaml"
+    cfg_path.write_text(
+        yaml.safe_dump(
+            {
+                "platforms": {
+                    "teams": {"enabled": True, "existing_key": "keep"},
+                },
+                "approvals": {"mode": "off"},
+            }
+        )
+    )
+    _write_overlay(
+        hermes_home,
+        monkeypatch,
+        {"platforms": {"teams": {"typing_indicator": False}}},
+    )
+    mod = _load_module()
+    assert mod.main() == 0
+
+    cfg = _read_cfg(hermes_home)
+    # Overlay added the new nested key...
+    assert cfg["platforms"]["teams"]["typing_indicator"] is False
+    # ...without disturbing siblings at any level.
+    assert cfg["platforms"]["teams"]["enabled"] is True
+    assert cfg["platforms"]["teams"]["existing_key"] == "keep"
+    assert cfg["approvals"]["mode"] == "off"
+
+
+def test_overlay_scalar_replaces_base(hermes_home, clean_env, monkeypatch):
+    """A scalar in the overlay replaces the base value at that path."""
+    cfg_path = hermes_home / "config.yaml"
+    cfg_path.write_text(yaml.safe_dump({"approvals": {"mode": "off"}}))
+    _write_overlay(hermes_home, monkeypatch, {"approvals": {"mode": "on"}})
+    mod = _load_module()
+    assert mod.main() == 0
+    assert _read_cfg(hermes_home)["approvals"]["mode"] == "on"
+
+
+def test_overlay_list_replaces_not_concatenates(
+    hermes_home, clean_env, monkeypatch
+):
+    """Lists are replaced wholesale, never concatenated."""
+    cfg_path = hermes_home / "config.yaml"
+    cfg_path.write_text(yaml.safe_dump({"toolsets": ["a", "b", "c"]}))
+    _write_overlay(hermes_home, monkeypatch, {"toolsets": ["x"]})
+    mod = _load_module()
+    assert mod.main() == 0
+    assert _read_cfg(hermes_home)["toolsets"] == ["x"]
+
+
+def test_overlay_null_overwrites(hermes_home, clean_env, monkeypatch):
+    """An explicit null in the overlay blanks the base value."""
+    cfg_path = hermes_home / "config.yaml"
+    cfg_path.write_text(yaml.safe_dump({"feature": {"flag": "enabled"}}))
+    # YAML `flag: null` → Python None
+    _write_overlay(hermes_home, monkeypatch, "feature:\n  flag: null\n")
+    mod = _load_module()
+    assert mod.main() == 0
+    cfg = _read_cfg(hermes_home)
+    assert "flag" in cfg["feature"]
+    assert cfg["feature"]["flag"] is None
+
+
+def test_overlay_wins_over_model_seeder(hermes_home, clean_env, monkeypatch):
+    """Overlay is applied last, so it beats HERMES_MODEL on the same key."""
+    monkeypatch.setenv("HERMES_MODEL", "env-model")
+    _write_overlay(hermes_home, monkeypatch, {"model": "overlay-model"})
+    mod = _load_module()
+    assert mod.main() == 0
+    assert _read_cfg(hermes_home)["model"] == "overlay-model"
+
+
+def test_overlay_applies_alongside_guardrail(hermes_home, clean_env, monkeypatch):
+    """Explicit seeders and overlay coexist when they touch disjoint keys."""
+    monkeypatch.setenv("BEDROCK_GUARDRAIL_ID", "gr-abc")
+    monkeypatch.setenv("BEDROCK_GUARDRAIL_VERSION", "DRAFT")
+    _write_overlay(
+        hermes_home, monkeypatch, {"display": {"personality": "vigo"}}
+    )
+    mod = _load_module()
+    assert mod.main() == 0
+    cfg = _read_cfg(hermes_home)
+    assert cfg["bedrock"]["guardrail"]["guardrail_identifier"] == "gr-abc"
+    assert cfg["display"]["personality"] == "vigo"
+
+
+def test_overlay_empty_file_is_noop(hermes_home, clean_env, monkeypatch):
+    """An empty (or whitespace-only) overlay file merges nothing."""
+    cfg_path = hermes_home / "config.yaml"
+    cfg_path.write_text(yaml.safe_dump({"model": "keep-me"}))
+    original_mtime = cfg_path.stat().st_mtime_ns
+    _write_overlay(hermes_home, monkeypatch, "   \n")
+    mod = _load_module()
+    assert mod.main() == 0
+    assert _read_cfg(hermes_home)["model"] == "keep-me"
+    assert cfg_path.stat().st_mtime_ns == original_mtime
+
+
+def test_overlay_non_mapping_is_skipped(hermes_home, clean_env, monkeypatch, capsys):
+    """A top-level list/scalar overlay is rejected (logged), config untouched."""
+    cfg_path = hermes_home / "config.yaml"
+    cfg_path.write_text(yaml.safe_dump({"model": "keep-me"}))
+    _write_overlay(hermes_home, monkeypatch, "- just\n- a\n- list\n")
+    mod = _load_module()
+    assert mod.main() == 0
+    assert _read_cfg(hermes_home)["model"] == "keep-me"
+    assert "WARNING" in capsys.readouterr().err
+
+
+def test_overlay_broken_yaml_fails_open(hermes_home, clean_env, monkeypatch, capsys):
+    """Unparseable overlay is skipped; existing config survives intact."""
+    cfg_path = hermes_home / "config.yaml"
+    cfg_path.write_text(yaml.safe_dump({"model": "keep-me"}))
+    _write_overlay(hermes_home, monkeypatch, "this: is: not: valid: [unbalanced")
+    mod = _load_module()
+    assert mod.main() == 0
+    assert _read_cfg(hermes_home)["model"] == "keep-me"
+    assert "WARNING" in capsys.readouterr().err
+
+
+def test_overlay_idempotent_when_matching(hermes_home, clean_env, monkeypatch):
+    """Overlay already reflected on disk → no rewrite, no mtime churn."""
+    cfg_path = hermes_home / "config.yaml"
+    cfg_path.write_text(yaml.safe_dump({"display": {"personality": "vigo"}}))
+    original_mtime = cfg_path.stat().st_mtime_ns
+    _write_overlay(
+        hermes_home, monkeypatch, {"display": {"personality": "vigo"}}
+    )
+    mod = _load_module()
+    assert mod.main() == 0
+    assert cfg_path.stat().st_mtime_ns == original_mtime
+
+
+def test_deep_merge_helper_unit():
+    """Direct unit coverage of the merge primitive."""
+    mod = _load_module()
+    base = {"a": {"b": 1, "c": 2}, "d": [1, 2], "e": "old"}
+    mod._deep_merge(base, {"a": {"c": 99, "x": 7}, "d": [3], "e": "new"})
+    assert base == {"a": {"b": 1, "c": 99, "x": 7}, "d": [3], "e": "new"}
