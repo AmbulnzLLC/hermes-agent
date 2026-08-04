@@ -2032,7 +2032,23 @@ class TeamsAdapter(BasePlatformAdapter):
         if not self._app:
             return
         try:
-            await self._app.send(chat_id, TypingActivityInput())
+            # Prefer the stored ConversationReference (captured from the
+            # inbound activity) over App.send's synthesized one.  App.send
+            # builds a bare ConversationReference from just the conversation
+            # id + bot account (see SDK apps/app.py::send) with no
+            # conversation_type / tenant — good enough to route a plain text
+            # message, but a typing activity needs the authoritative
+            # conversation context to actually render.  This is why a typing
+            # indicator resumed proactively after a clarify wait (from the
+            # background _keep_typing loop) never showed: resume_typing_for_chat
+            # un-pauses the loop, the loop calls send_typing, but the bare-ref
+            # typing activity didn't render.  Mirror the conv_ref-first dispatch
+            # send_card / send_image / send_document already use.
+            conv_ref = self._conv_refs.get(chat_id)
+            if conv_ref:
+                await self._app.activity_sender.send(TypingActivityInput(), conv_ref)
+            else:
+                await self._app.send(chat_id, TypingActivityInput())
         except Exception:
             pass
 

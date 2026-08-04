@@ -302,6 +302,53 @@ async def test_send_attachment_uses_conv_ref_when_available(adapter, doc_file):
     adapter._app.send.assert_not_awaited()
 
 
+# ---------------------------------------------------------------------------
+# send_typing dispatch — must use the stored ConversationReference when one
+# exists, mirroring send_card / send_image / send_document.  App.send builds a
+# bare ConversationReference (no conversation_type / tenant) that routes plain
+# text fine but does NOT render a typing activity — the reason a typing
+# indicator resumed proactively after a clarify wait never showed up in Teams.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_send_typing_uses_conv_ref_when_available(adapter):
+    # Bind the real SDK symbols (TypingActivityInput) so send_typing can
+    # construct the activity regardless of test ordering — connect() binds
+    # these lazily via check_requirements(); this test never calls connect().
+    from plugins.platforms.teams import adapter as _teams_mod
+    _teams_mod.check_requirements()
+
+    chat_id = "a:dm-with-ref"
+    ref = Mock()
+    ref.conversation = Mock(conversation_type="personal")
+    adapter._conv_refs[chat_id] = ref
+
+    await adapter.send_typing(chat_id)
+
+    adapter._app.activity_sender.send.assert_awaited_once()
+    # The activity is a TypingActivityInput, and the stored ref is passed through.
+    sent_activity, sent_ref = adapter._app.activity_sender.send.await_args.args
+    assert isinstance(sent_activity, _teams_mod.TypingActivityInput)
+    assert sent_ref is ref
+    adapter._app.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_typing_falls_back_to_app_send_without_conv_ref(adapter):
+    from plugins.platforms.teams import adapter as _teams_mod
+    _teams_mod.check_requirements()
+
+    chat_id = "a:dm-no-ref"  # no conv_ref stored
+    await adapter.send_typing(chat_id)
+
+    adapter._app.send.assert_awaited_once()
+    sent_chat_id, sent_activity = adapter._app.send.await_args.args
+    assert sent_chat_id == chat_id
+    assert isinstance(sent_activity, _teams_mod.TypingActivityInput)
+    adapter._app.activity_sender.send.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_send_attachment_forwards_content_url_to_sdk_attachment(adapter):
     """``_send_attachment`` must forward ``contentUrl`` to the SDK Attachment.
