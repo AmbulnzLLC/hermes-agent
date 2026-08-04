@@ -940,6 +940,16 @@ async def test_connect_captures_running_loop(monkeypatch, adapter):
     confirm the running gateway loop lands in ``self._loop``."""
     import asyncio as _asyncio
 
+    # connect() now binds the SDK symbols lazily via check_requirements()
+    # (the #62935 find_spec/.env-pollution fix) rather than at module import.
+    # Bind the real symbols first so ones this test does NOT monkeypatch
+    # (e.g. ClientOptions, used at App() construction) are non-None; the
+    # monkeypatches below then override App + the aiohttp listener. Without
+    # this the test only passed when another test happened to bind the
+    # globals first (order-dependent).
+    from plugins.platforms.teams import adapter as _teams_mod
+    _teams_mod.check_requirements()
+
     # Stub out the SDK App + its initialize() coro. The fixture already
     # filled ``adapter._app`` with a mock; we replace the App() *class*
     # used inside connect() so the new instance also matches.

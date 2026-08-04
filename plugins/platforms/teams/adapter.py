@@ -30,7 +30,8 @@ import os
 import re
 import time
 from collections import OrderedDict
-from typing import Any, Dict, Optional
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, Optional
 from urllib.parse import quote
 
 # httpx is imported lazily — only the ``_write_summary_via_incoming_webhook``
@@ -50,52 +51,45 @@ except ImportError:
     AIOHTTP_AVAILABLE = False
     web = None  # type: ignore[assignment]
 
-try:
-    from microsoft_teams.apps import App, ActivityContext
-    from microsoft_teams.common.http.client import ClientOptions
-    from microsoft_teams.api import MessageActivity, ConversationReference
-    from microsoft_teams.api.activities.typing import TypingActivityInput
-    from microsoft_teams.api.activities.invoke.adaptive_card import AdaptiveCardInvokeActivity
-    from microsoft_teams.api.activities.invoke.file_consent import FileConsentInvokeActivity
-    from microsoft_teams.api.models import FileUploadInfo
-    from microsoft_teams.api.models.adaptive_card import (
-        AdaptiveCardActionCardResponse,
-        AdaptiveCardActionMessageResponse,
-    )
-    from microsoft_teams.api.models.invoke_response import InvokeResponse, AdaptiveCardInvokeResponse
-    from microsoft_teams.apps.http.adapter import (
-        HttpMethod,
-        HttpRequest,
-        HttpResponse,
-        HttpRouteHandler,
-    )
-    from microsoft_teams.cards import AdaptiveCard, Choice, ChoiceSetInput, ExecuteAction, TextBlock
+# microsoft-teams-apps calls ``load_dotenv(find_dotenv(usecwd=True))`` at
+# ``microsoft_teams.apps.app`` import time. Importing the SDK eagerly during
+# plugin discovery / ``TeamsSummaryWriter`` imports would pollute process
+# ``os.environ`` from a cwd-discovered ``.env`` — typically a root profile's
+# secrets (upstream #62935). Detect *presence* via ``find_spec`` only; the
+# real symbols are bound lazily in ``check_requirements()`` behind a dotenv
+# no-op (see ``_suppress_third_party_dotenv``). ``TEAMS_SDK_AVAILABLE`` True
+# from ``find_spec`` means "installed", NOT "imported" — ``App is not None``
+# is the authoritative "symbols bound" signal.
+import importlib.util
+import sys as _sys
 
-    TEAMS_SDK_AVAILABLE = True
-except ImportError:
-    TEAMS_SDK_AVAILABLE = False
-    ClientOptions = None  # type: ignore[assignment,misc]
-    App = None  # type: ignore[assignment,misc]
-    ActivityContext = None  # type: ignore[assignment,misc]
-    MessageActivity = None  # type: ignore[assignment,misc]
-    ConversationReference = None  # type: ignore[assignment,misc]
-    TypingActivityInput = None  # type: ignore[assignment,misc]
-    AdaptiveCardInvokeActivity = None  # type: ignore[assignment,misc]
-    FileConsentInvokeActivity = None  # type: ignore[assignment,misc]
-    FileUploadInfo = None  # type: ignore[assignment,misc]
-    AdaptiveCardActionCardResponse = None  # type: ignore[assignment,misc]
-    AdaptiveCardActionMessageResponse = None  # type: ignore[assignment,misc]
-    AdaptiveCardInvokeResponse = None  # type: ignore[assignment,misc,union-attr]
-    InvokeResponse = None  # type: ignore[assignment,misc]
-    HttpMethod = str  # type: ignore[assignment,misc]
-    HttpRequest = None  # type: ignore[assignment,misc]
-    HttpResponse = None  # type: ignore[assignment,misc]
-    HttpRouteHandler = None  # type: ignore[assignment,misc]
-    AdaptiveCard = None  # type: ignore[assignment,misc]
-    ExecuteAction = None  # type: ignore[assignment,misc]
-    TextBlock = None  # type: ignore[assignment,misc]
-    Choice = None  # type: ignore[assignment,misc]
-    ChoiceSetInput = None  # type: ignore[assignment,misc]
+try:
+    TEAMS_SDK_AVAILABLE = importlib.util.find_spec("microsoft_teams") is not None
+except ValueError:
+    # Test stubs may inject a module without ``__spec__``.
+    TEAMS_SDK_AVAILABLE = "microsoft_teams" in _sys.modules
+ClientOptions = None  # type: ignore[assignment,misc]
+App = None  # type: ignore[assignment,misc]
+ActivityContext = None  # type: ignore[assignment,misc]
+MessageActivity = None  # type: ignore[assignment,misc]
+ConversationReference = None  # type: ignore[assignment,misc]
+TypingActivityInput = None  # type: ignore[assignment,misc]
+AdaptiveCardInvokeActivity = None  # type: ignore[assignment,misc]
+FileConsentInvokeActivity = None  # type: ignore[assignment,misc]
+FileUploadInfo = None  # type: ignore[assignment,misc]
+AdaptiveCardActionCardResponse = None  # type: ignore[assignment,misc]
+AdaptiveCardActionMessageResponse = None  # type: ignore[assignment,misc]
+AdaptiveCardInvokeResponse = None  # type: ignore[assignment,misc,union-attr]
+InvokeResponse = None  # type: ignore[assignment,misc]
+HttpMethod = str  # type: ignore[assignment,misc]
+HttpRequest = None  # type: ignore[assignment,misc]
+HttpResponse = None  # type: ignore[assignment,misc]
+HttpRouteHandler = None  # type: ignore[assignment,misc]
+AdaptiveCard = None  # type: ignore[assignment,misc]
+ExecuteAction = None  # type: ignore[assignment,misc]
+TextBlock = None  # type: ignore[assignment,misc]
+Choice = None  # type: ignore[assignment,misc]
+ChoiceSetInput = None  # type: ignore[assignment,misc]
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
@@ -106,15 +100,32 @@ from gateway.platforms.base import (
     SendResult,
     SUPPORTED_DOCUMENT_TYPES,
     cache_audio_from_url,
-    cache_document_from_bytes,
     cache_image_from_url,
+    cache_media_bytes,
     cache_video_from_url,
 )
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_PORT = 3978
+# ``None`` → aiohttp/asyncio ``create_server`` binds one listening socket per
+# address family (IPv4 + IPv6). The old hardcoded "0.0.0.0" bound IPv4 ONLY
+# and was unreachable over IPv6-only private networks (e.g. Fly.io 6PN) —
+# same bug as the LINE adapter (NS-603) and gateway/platforms/webhook.py
+# (d542894ad). Pin a host via TEAMS_HOST or extra.host.
+_DEFAULT_HOST = None
 _WEBHOOK_PATH = "/api/messages"
+
+# Maps ``CachedMedia.kind`` (returned by ``cache_media_bytes``) onto the
+# adapter's ``MessageType`` override so a re-classified attachment (e.g. a
+# ``.mov`` that arrived as a generic file) surfaces with the right message
+# type. Unknown kinds fall back to DOCUMENT at the call site.
+_MSG_TYPE_FOR_KIND = {
+    "image": MessageType.PHOTO,
+    "video": MessageType.VIDEO,
+    "audio": MessageType.VOICE,
+    "document": MessageType.DOCUMENT,
+}
 
 
 def _parse_bool(value: Any, *, default: bool = False) -> bool:
@@ -403,11 +414,44 @@ class _AiohttpBridgeAdapter:
         pass
 
 
+@contextmanager
+def _suppress_third_party_dotenv() -> Iterator[None]:
+    """No-op ``dotenv.load_dotenv`` while importing the Teams SDK (#62935).
+
+    ``microsoft_teams.apps.app`` calls ``load_dotenv(find_dotenv(usecwd=True))``
+    at module import time. That mutates process-global ``os.environ`` from
+    whatever ``.env`` sits above cwd — typically a root profile's secrets.
+    Hermes owns dotenv loading; third-party import side effects must not.
+    """
+    try:
+        import dotenv as _dotenv
+    except ImportError:
+        yield
+        return
+    original = getattr(_dotenv, "load_dotenv", None)
+    if original is None:
+        yield
+        return
+    _dotenv.load_dotenv = lambda *args, **kwargs: False  # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        _dotenv.load_dotenv = original  # type: ignore[assignment]
+
+
 def check_requirements() -> bool:
     """Return True when all Teams dependencies and credentials are present.
 
     Lazy-installs microsoft-teams-apps via ``tools.lazy_deps.ensure("platform.teams")``
     on first call if not present, following the same pattern as check_slack_requirements().
+
+    The module now detects SDK *presence* via ``find_spec`` at import time
+    (``TEAMS_SDK_AVAILABLE``) WITHOUT importing it — so the real symbols
+    (``App`` et al.) stay ``None`` until this function binds them. The
+    idempotency guard therefore keys off ``App is not None`` (symbols bound),
+    NOT ``TEAMS_SDK_AVAILABLE`` (merely installed); the latter is True from
+    ``find_spec`` before any import has run. The SDK import runs behind
+    ``_suppress_third_party_dotenv()`` so it can't pollute ``os.environ``.
     """
     global TEAMS_SDK_AVAILABLE, AIOHTTP_AVAILABLE, web
     global App, ActivityContext, ClientOptions, MessageActivity, ConversationReference
@@ -419,7 +463,7 @@ def check_requirements() -> bool:
     global AdaptiveCard, ExecuteAction, TextBlock
     global Choice, ChoiceSetInput
 
-    if TEAMS_SDK_AVAILABLE and AIOHTTP_AVAILABLE:
+    if App is not None and AIOHTTP_AVAILABLE:
         return True
     try:
         from tools.lazy_deps import ensure as _lazy_ensure
@@ -428,31 +472,33 @@ def check_requirements() -> bool:
         return False
     try:
         from aiohttp import web as _web
-        from microsoft_teams.apps import App as _App, ActivityContext as _ActivityContext
-        from microsoft_teams.common.http.client import ClientOptions as _ClientOptions
-        from microsoft_teams.api import MessageActivity as _MessageActivity, ConversationReference as _ConversationReference
-        from microsoft_teams.api.activities.typing import TypingActivityInput as _TypingActivityInput
-        from microsoft_teams.api.activities.invoke.adaptive_card import AdaptiveCardInvokeActivity as _AdaptiveCardInvokeActivity
-        from microsoft_teams.api.activities.invoke.file_consent import FileConsentInvokeActivity as _FileConsentInvokeActivity
-        from microsoft_teams.api.models import FileUploadInfo as _FileUploadInfo
-        from microsoft_teams.api.models.adaptive_card import (
-            AdaptiveCardActionCardResponse as _AdaptiveCardActionCardResponse,
-            AdaptiveCardActionMessageResponse as _AdaptiveCardActionMessageResponse,
-        )
-        from microsoft_teams.api.models.invoke_response import InvokeResponse as _InvokeResponse, AdaptiveCardInvokeResponse as _AdaptiveCardInvokeResponse
-        from microsoft_teams.apps.http.adapter import (
-            HttpMethod as _HttpMethod,
-            HttpRequest as _HttpRequest,
-            HttpResponse as _HttpResponse,
-            HttpRouteHandler as _HttpRouteHandler,
-        )
-        from microsoft_teams.cards import (
-            AdaptiveCard as _AdaptiveCard,
-            Choice as _Choice,
-            ChoiceSetInput as _ChoiceSetInput,
-            ExecuteAction as _ExecuteAction,
-            TextBlock as _TextBlock,
-        )
+
+        with _suppress_third_party_dotenv():
+            from microsoft_teams.apps import App as _App, ActivityContext as _ActivityContext
+            from microsoft_teams.common.http.client import ClientOptions as _ClientOptions
+            from microsoft_teams.api import MessageActivity as _MessageActivity, ConversationReference as _ConversationReference
+            from microsoft_teams.api.activities.typing import TypingActivityInput as _TypingActivityInput
+            from microsoft_teams.api.activities.invoke.adaptive_card import AdaptiveCardInvokeActivity as _AdaptiveCardInvokeActivity
+            from microsoft_teams.api.activities.invoke.file_consent import FileConsentInvokeActivity as _FileConsentInvokeActivity
+            from microsoft_teams.api.models import FileUploadInfo as _FileUploadInfo
+            from microsoft_teams.api.models.adaptive_card import (
+                AdaptiveCardActionCardResponse as _AdaptiveCardActionCardResponse,
+                AdaptiveCardActionMessageResponse as _AdaptiveCardActionMessageResponse,
+            )
+            from microsoft_teams.api.models.invoke_response import InvokeResponse as _InvokeResponse, AdaptiveCardInvokeResponse as _AdaptiveCardInvokeResponse
+            from microsoft_teams.apps.http.adapter import (
+                HttpMethod as _HttpMethod,
+                HttpRequest as _HttpRequest,
+                HttpResponse as _HttpResponse,
+                HttpRouteHandler as _HttpRouteHandler,
+            )
+            from microsoft_teams.cards import (
+                AdaptiveCard as _AdaptiveCard,
+                Choice as _Choice,
+                ChoiceSetInput as _ChoiceSetInput,
+                ExecuteAction as _ExecuteAction,
+                TextBlock as _TextBlock,
+            )
     except ImportError:
         return False
     web = _web
@@ -875,6 +921,11 @@ class TeamsAdapter(BasePlatformAdapter):
         self._port = _coerce_port(
             extra.get("port") or os.getenv("TEAMS_PORT", str(_DEFAULT_PORT))
         )
+        # Falsy host (unset/"") collapses to the dual-stack default (None), so
+        # aiohttp binds both IPv4 and IPv6. Pin explicitly via extra.host or
+        # TEAMS_HOST when a single family is required.
+        _raw_host = extra.get("host") or os.getenv("TEAMS_HOST", "") or _DEFAULT_HOST
+        self._host: Optional[str] = str(_raw_host) if _raw_host else None
         self._app: Optional["App"] = None
         self._runner: Optional["web.AppRunner"] = None
         # Captured in connect() so tools/send_message_tool._send_teams can
@@ -911,11 +962,17 @@ class TeamsAdapter(BasePlatformAdapter):
         self._graph: Any = None
         self._token_provider: Any = None
 
-    async def connect(self) -> bool:
-        if not TEAMS_SDK_AVAILABLE:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        # SDK symbols are no longer imported eagerly at module load (find_spec
+        # detection only, to avoid .env pollution — #62935). Bind them now via
+        # the lazy-install path, which also installs microsoft-teams-apps on
+        # first use (parity with Slack/Discord/etc.), then re-check the module
+        # globals it rebinds.
+        check_requirements()
+        if App is None or not TEAMS_SDK_AVAILABLE:
             self._set_fatal_error(
                 "MISSING_SDK",
-                "microsoft-teams-apps not installed. Run: pip install microsoft-teams-apps",
+                "microsoft-teams-apps could not be installed. Run: pip install microsoft-teams-apps",
                 retryable=False,
             )
             return False
@@ -972,7 +1029,9 @@ class TeamsAdapter(BasePlatformAdapter):
 
             self._runner = web.AppRunner(aiohttp_app)
             await self._runner.setup()
-            site = web.TCPSite(self._runner, "0.0.0.0", self._port)
+            # host=None → dual-stack bind (IPv4 + IPv6); previously hardcoded
+            # "0.0.0.0" (IPv4-only). See _DEFAULT_HOST comment.
+            site = web.TCPSite(self._runner, self._host, self._port)
             await site.start()
 
             self._running = True
@@ -1365,16 +1424,46 @@ class TeamsAdapter(BasePlatformAdapter):
                         msg_type_override = msg_type_override or MessageType.VIDEO
                     elif file_type in _DOC_EXT_TO_MIME:
                         logger.info("[teams][attach][%d] dispatch=document_bytes ext=%s mime=%s", idx, file_type, _DOC_EXT_TO_MIME[file_type])
-                        cached = cache_document_from_bytes(data, filename)
-                        logger.info("[teams][attach][%d] cache_document_from_bytes -> %r", idx, cached)
-                        media_urls.append(cached)
-                        media_types.append(_DOC_EXT_TO_MIME[file_type])
-                        msg_type_override = msg_type_override or MessageType.DOCUMENT
-                    else:
-                        logger.info(
-                            "[teams][attach][%d] DROP unsupported file_type (file_type=%r, name=%r)",
-                            idx, file_type, filename,
+                        # Adopt upstream's unified caching entry point
+                        # (cache_media_bytes) instead of the document-only
+                        # cache_document_from_bytes. It classifies by
+                        # filename/MIME and routes to the right cache_* helper,
+                        # returning a CachedMedia we map back onto the fork's
+                        # (media_urls, media_types, msg_type_override) contract.
+                        cached_media = cache_media_bytes(
+                            data, filename=filename, mime_type=_DOC_EXT_TO_MIME[file_type]
                         )
+                        logger.info("[teams][attach][%d] cache_media_bytes -> %r", idx, cached_media)
+                        if cached_media:
+                            media_urls.append(cached_media.path)
+                            media_types.append(cached_media.media_type or _DOC_EXT_TO_MIME[file_type])
+                            msg_type_override = msg_type_override or _MSG_TYPE_FOR_KIND.get(
+                                cached_media.kind, MessageType.DOCUMENT
+                            )
+                        else:
+                            logger.info(
+                                "[teams][attach][%d] DROP cache_media_bytes returned None (file_type=%r, name=%r)",
+                                idx, file_type, filename,
+                            )
+                    else:
+                        # Unknown/unsupported file type. Upstream surfaces ANY
+                        # file to the agent rather than dropping it — cache the
+                        # raw bytes as a document via cache_media_bytes so the
+                        # agent can still inspect it with terminal / read_file.
+                        logger.info("[teams][attach][%d] dispatch=unknown_bytes -> cache_media_bytes ext=%s", idx, file_type)
+                        cached_media = cache_media_bytes(data, filename=filename, mime_type="")
+                        logger.info("[teams][attach][%d] cache_media_bytes(unknown) -> %r", idx, cached_media)
+                        if cached_media:
+                            media_urls.append(cached_media.path)
+                            media_types.append(cached_media.media_type or "application/octet-stream")
+                            msg_type_override = msg_type_override or _MSG_TYPE_FOR_KIND.get(
+                                cached_media.kind, MessageType.DOCUMENT
+                            )
+                        else:
+                            logger.info(
+                                "[teams][attach][%d] DROP unsupported file_type (file_type=%r, name=%r)",
+                                idx, file_type, filename,
+                            )
                     continue
 
                 # ── Fell through every branch ────────────────────────────────
