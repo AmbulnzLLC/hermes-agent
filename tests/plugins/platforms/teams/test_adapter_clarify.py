@@ -11,6 +11,24 @@ from plugins.platforms.teams.adapter import TeamsAdapter
 from plugins.platforms.teams import adapter as teams_adapter_module
 
 
+@pytest.fixture(autouse=True)
+def _bind_teams_sdk_symbols():
+    """Bind the microsoft_teams SDK symbols before each test.
+
+    The adapter no longer imports the SDK eagerly at module load — it detects
+    presence via ``find_spec`` and binds the real symbols lazily in
+    ``check_requirements()`` (the #62935 .env-pollution fix). Card-rendering
+    paths (``send_clarify``, ``_on_clarify_action``) dereference module globals
+    like ``AdaptiveCard`` / ``TextBlock`` / ``Choice`` / ``ChoiceSetInput`` that
+    stay ``None`` until that runs. In production ``connect()`` binds them first;
+    here we call ``check_requirements()`` to reproduce that state. Tests that
+    assert on the unbound state (see ``TestLateImportBindings``) manage their
+    own globals via monkeypatch, which pytest restores on teardown.
+    """
+    teams_adapter_module.check_requirements()
+    yield
+
+
 def _make_adapter() -> TeamsAdapter:
     """Build an adapter with the minimum scaffolding tests need."""
     a = TeamsAdapter.__new__(TeamsAdapter)
