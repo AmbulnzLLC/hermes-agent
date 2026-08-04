@@ -58,6 +58,9 @@ same precedence convention as the ``nous`` plugin)::
           scopes: "openid profile email"                           # optional
           # client_secret: set ONLY for a confidential client. It is a
           # credential — prefer the env var / ~/.hermes/.env over config.yaml.
+          allowed_users:                                           # optional
+            - alice                                                # authorization
+            - bob@example.com                                      # allowlist
 
     # Environment overrides (Docker/Fly secret injection)
     HERMES_DASHBOARD_OIDC_ISSUER
@@ -66,6 +69,20 @@ same precedence convention as the ``nous`` plugin)::
     HERMES_DASHBOARD_OIDC_CLIENT_SECRET # optional; set for a confidential client
                                         # (the .env file is the canonical home —
                                         # it's a secret, not a behavioural setting)
+    HERMES_DASHBOARD_OIDC_ALLOWED_USERS # optional; comma/space separated. Bridge
+                                        # for orchestrators that inject per-pod
+                                        # identity as env; config.yaml is canonical
+
+**Authentication vs authorization.** By default this provider authorizes every
+identity the IDP authenticates — correct for a single-tenant dashboard, but on
+a *shared* IDP (one realm, many dashboards) it means any realm user can sign
+in to any dashboard. Setting ``allowed_users`` adds a local authorization
+allowlist matched case-insensitively against the verified ``preferred_username``
+and ``email`` claims (plus the email's local-part, so bare usernames match an
+IDP that only returns email). It is enforced in ``_session_from_tokens`` — the
+chokepoint shared by login, refresh, and the per-request ``verify_session`` —
+so removing a user takes effect on their next request, not just at next login.
+Empty/unset preserves the historical allow-all behaviour.
 
 Skip reasons: when the plugin loads but can't register (missing issuer /
 client_id), it writes a human-readable reason to the module-level
@@ -79,6 +96,7 @@ import base64
 import hashlib
 import logging
 import os
+import re
 import secrets
 import threading
 import time
@@ -135,6 +153,42 @@ LAST_SKIP_REASON: str = ""
 
 
 # ---------------------------------------------------------------------------
+# Authorization (optional local allowlist)
+# ---------------------------------------------------------------------------
+
+
+class AuthorizationDeniedError(Exception):
+    """The IDP authenticated the user, but local policy refuses them.
+
+    Distinct from every transport/credential error: authentication SUCCEEDED
+    and the ID token verified — we are declining to mint a Session for this
+    identity. Callers translate it into the per-path exception the middleware
+    expects (see ``_exchange`` and ``verify_session``) so a denied user is
+    bounced to re-login rather than shown a 503 "IDP unreachable".
+    """
+
+
+def _parse_allowed_users(raw: Any) -> tuple[str, ...]:
+    """Normalise the allowlist into a lowercase tuple.
+
+    Accepts a list (config.yaml's natural shape) or a comma/whitespace
+    separated string (the env-var shape). Entries are lowercased and stripped;
+    empties are dropped. An empty result means "no allowlist" — the provider
+    then authorizes every authenticated identity, which is the historical
+    behaviour and therefore the default.
+    """
+    if raw is None:
+        return ()
+    if isinstance(raw, str):
+        items = re.split(r"[,\s]+", raw)
+    elif isinstance(raw, (list, tuple, set)):
+        items = [str(i) for i in raw]
+    else:
+        items = [str(raw)]
+    return tuple(sorted({s.strip().lower() for s in items if s and s.strip()}))
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -184,6 +238,7 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         client_id: str,
         scopes: str = _DEFAULT_SCOPES,
         client_secret: str = "",
+        allowed_users: Any = None,
     ) -> None:
         if not issuer:
             raise ValueError("issuer is required")
@@ -202,6 +257,11 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         # provisioned-but-blank secret can't flip us into a broken confidential
         # mode that sends an empty client_secret. Non-empty ⇒ confidential.
         self._client_secret = (client_secret or "").strip()
+
+        # Optional local authorization allowlist, matched against the verified
+        # ``preferred_username``/``email`` claims. Empty ⇒ no allowlist, every
+        # authenticated identity is authorized (historical behaviour).
+        self._allowed_users = _parse_allowed_users(allowed_users)
 
         # Discovery + JWKS are lazily resolved on first use so plugin
         # registration never makes a network call (the IDP may be down at
@@ -314,9 +374,18 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
             raise
         # No refresh token available on this path; "" is fine — the middleware
         # re-reads the refresh-token cookie separately for refresh_session.
-        return self._session_from_tokens(
-            id_token=access_token, refresh_token="", claims=claims
-        )
+        try:
+            return self._session_from_tokens(
+                id_token=access_token, refresh_token="", claims=claims
+            )
+        except AuthorizationDeniedError:
+            # Contract: verify_session returns None for a token it will not
+            # honour (raising ProviderError here would mean "IDP unreachable"
+            # and yield a 503 the user could never clear). Returning None sends
+            # the middleware down the refresh path, which also denies, and the
+            # user lands back at /login. This is what revokes access on the
+            # NEXT REQUEST for a user removed from the allowlist mid-session.
+            return None
 
     def revoke_session(self, *, refresh_token: str) -> None:
         # Best-effort RFC 7009 revocation if the IDP advertised an endpoint.
@@ -470,9 +539,19 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         if not isinstance(refresh_token, str) or not refresh_token:
             refresh_token = previous_refresh_token or ""
 
-        return self._session_from_tokens(
-            id_token=id_token, refresh_token=refresh_token, claims=claims
-        )
+        try:
+            return self._session_from_tokens(
+                id_token=id_token, refresh_token=refresh_token, claims=claims
+            )
+        except AuthorizationDeniedError as exc:
+            # Authentication succeeded but local policy declines this identity.
+            # Translate to the caller's bad-request exception so the middleware
+            # treats it as a credential problem (400 / force re-login) rather
+            # than a transient IDP outage (503 + retry, which would loop). On
+            # the refresh path this is RefreshExpiredError, which correctly
+            # clears the session for a user removed from the allowlist
+            # mid-session.
+            raise bad_request_exc(str(exc)) from exc
 
     # ---- internals: discovery ---------------------------------------------
 
@@ -661,6 +740,48 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
 
     # ---- internals: mapping + misc ----------------------------------------
 
+    def _authorize_claims(self, claims: Dict[str, Any]) -> None:
+        """Enforce the local allowlist against verified claims.
+
+        Called from ``_session_from_tokens`` — the single chokepoint every
+        Session flows through (auth-code exchange, refresh, and the
+        per-request ``verify_session``) — so a revoked user loses access on
+        their next request, not merely at next login.
+
+        Matching is case-insensitive against ``preferred_username`` and
+        ``email``, plus the local-part of the email. Only claims from an
+        ID token that already passed signature/issuer/audience verification
+        reach here, so these values are trustworthy.
+        """
+        if not self._allowed_users:
+            return
+
+        candidates = set()
+        for claim in ("preferred_username", "email"):
+            value = str(claims.get(claim, "") or "").strip().lower()
+            if value:
+                candidates.add(value)
+                # Accept the email local-part so an allowlist of bare
+                # usernames matches an IDP that only returns an email.
+                if claim == "email" and "@" in value:
+                    candidates.add(value.split("@", 1)[0])
+
+        if candidates & set(self._allowed_users):
+            return
+
+        # Log the subject, never the whole claim set (PII); the operator can
+        # correlate via the IDP. Denials are security-relevant → warning.
+        logger.warning(
+            "dashboard-auth-self-hosted: denying authenticated identity "
+            "sub=%s — not in allowed_users allowlist (%d entr%s)",
+            claims.get("sub", "<unknown>"),
+            len(self._allowed_users),
+            "y" if len(self._allowed_users) == 1 else "ies",
+        )
+        raise AuthorizationDeniedError(
+            "authenticated identity is not permitted on this dashboard"
+        )
+
     def _session_from_tokens(
         self,
         *,
@@ -675,6 +796,10 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         OAuth access token is intentionally NOT stored — Hermes does not call
         any resource API with it; the dashboard only needs identity.
         """
+        # Authorization gate. Runs before any Session is built so a denied
+        # identity can never yield a usable session on any code path.
+        self._authorize_claims(claims)
+
         user_id = str(claims.get("sub", ""))
         if not user_id:
             raise ProviderError("ID token missing 'sub' (user_id) claim")
@@ -822,6 +947,17 @@ def register(ctx) -> None:
     client_secret = _resolve_setting(
         "HERMES_DASHBOARD_OIDC_CLIENT_SECRET", oidc_cfg.get("client_secret")
     )
+    # Optional authorization allowlist. NOT a secret, so config.yaml
+    # (``dashboard.oauth.self_hosted.allowed_users``, a YAML list) is the
+    # canonical surface; the env var exists because container orchestrators
+    # inject per-pod identity that way. Unset ⇒ no allowlist ⇒ every
+    # authenticated identity is authorized (unchanged behaviour).
+    allowed_users_raw: Any = os.environ.get(
+        "HERMES_DASHBOARD_OIDC_ALLOWED_USERS", ""
+    ).strip()
+    if not allowed_users_raw:
+        allowed_users_raw = oidc_cfg.get("allowed_users")
+    allowed_users = _parse_allowed_users(allowed_users_raw)
 
     if not issuer or not client_id:
         LAST_SKIP_REASON = (
@@ -842,6 +978,7 @@ def register(ctx) -> None:
             client_id=client_id,
             scopes=scopes,
             client_secret=client_secret,
+            allowed_users=allowed_users,
         )
     except (ValueError, ProviderError) as exc:
         LAST_SKIP_REASON = (
@@ -853,10 +990,15 @@ def register(ctx) -> None:
     ctx.register_dashboard_auth_provider(provider)
     logger.info(
         "dashboard-auth-self-hosted: registered provider "
-        "(issuer=%s, client_id=%s, scopes=%r, confidential=%s)",
+        "(issuer=%s, client_id=%s, scopes=%r, confidential=%s, "
+        "allowed_users=%s)",
         issuer,
         client_id,
         scopes,
         # Log only whether a secret is present, never the secret itself.
         bool(client_secret),
+        # Count, not the identities themselves. "unrestricted" is called out
+        # explicitly so an operator who *intended* an allowlist but misspelled
+        # the key sees it in the boot log instead of silently allowing everyone.
+        f"{len(allowed_users)} entries" if allowed_users else "unrestricted",
     )

@@ -133,6 +133,7 @@ def _make_provider(
     scopes: str | None = None,
     client_secret: str | None = None,
     auth_methods: Any = "__unset__",
+    allowed_users: Any = None,
 ):
     """Construct a provider with discovery + JWKS stubbed (no network).
 
@@ -140,12 +141,16 @@ def _make_provider(
     overrides ``token_endpoint_auth_methods_supported`` in the seeded discovery
     doc (pass a list, or ``None`` to omit the key entirely); left unset, the
     discovery doc carries no auth-methods key (the absent-key default).
+    ``allowed_users`` enables the local authorization allowlist; ``None``
+    (the default) leaves it unrestricted.
     """
     kwargs: Dict[str, Any] = {"issuer": _ISSUER, "client_id": _CLIENT_ID}
     if scopes is not None:
         kwargs["scopes"] = scopes
     if client_secret is not None:
         kwargs["client_secret"] = client_secret
+    if allowed_users is not None:
+        kwargs["allowed_users"] = allowed_users
     p = oidc_plugin.SelfHostedOIDCProvider(**kwargs)
     # Pre-seed discovery so nothing hits the network.
     disco = dict(_DISCOVERY_DOC)
@@ -616,6 +621,7 @@ class TestPluginRegister:
             "HERMES_DASHBOARD_OIDC_CLIENT_ID",
             "HERMES_DASHBOARD_OIDC_SCOPES",
             "HERMES_DASHBOARD_OIDC_CLIENT_SECRET",
+            "HERMES_DASHBOARD_OIDC_ALLOWED_USERS",
         ):
             monkeypatch.delenv(var, raising=False)
 
@@ -727,3 +733,301 @@ class TestPluginRegister:
         registered = ctx.register_dashboard_auth_provider.call_args.args[0]
         assert registered._client_secret == "cfg-secret"
 
+
+
+# ---------------------------------------------------------------------------
+# Authorization allowlist (allowed_users)
+# ---------------------------------------------------------------------------
+
+
+class TestAllowedUsersParsing:
+    """The allowlist accepts both the YAML-list and env-string shapes."""
+
+    def test_none_is_unrestricted(self):
+        assert oidc_plugin._parse_allowed_users(None) == ()
+
+    def test_empty_string_is_unrestricted(self):
+        assert oidc_plugin._parse_allowed_users("") == ()
+        assert oidc_plugin._parse_allowed_users("   ") == ()
+
+    def test_parses_list(self):
+        assert oidc_plugin._parse_allowed_users(["bob", "alice"]) == (
+            "alice",
+            "bob",
+        )
+
+    def test_parses_comma_separated_string(self):
+        assert oidc_plugin._parse_allowed_users("alice, bob") == ("alice", "bob")
+
+    def test_parses_whitespace_separated_string(self):
+        assert oidc_plugin._parse_allowed_users("alice  bob\tcarol") == (
+            "alice",
+            "bob",
+            "carol",
+        )
+
+    def test_lowercases_and_dedupes(self):
+        assert oidc_plugin._parse_allowed_users(["Alice", "ALICE", "alice"]) == (
+            "alice",
+        )
+
+    def test_drops_empty_entries(self):
+        assert oidc_plugin._parse_allowed_users("alice,,  ,bob") == (
+            "alice",
+            "bob",
+        )
+
+
+class TestAuthorizationEnforcement:
+    """End-to-end: a denied identity must not obtain a session on ANY path."""
+
+    def _token_response(self, id_token: str, refresh_token: str = "rt_initial"):
+        return _mock_post(
+            200,
+            {
+                "access_token": "opaque-at",
+                "id_token": id_token,
+                "token_type": "Bearer",
+                "refresh_token": refresh_token,
+            },
+        )
+
+    def _login(self, provider, id_token):
+        with patch(
+            "plugins.dashboard_auth.self_hosted.httpx.post",
+            return_value=self._token_response(id_token),
+        ):
+            return provider.complete_login(
+                code="abc",
+                state="s",
+                code_verifier="vfy",
+                redirect_uri="https://hermes.example/auth/callback",
+            )
+
+    # ---- default (no allowlist) is unchanged behaviour --------------------
+
+    def test_no_allowlist_authorizes_everyone(self, rsa_keypair):
+        provider = _make_provider(rsa_keypair)
+        id_token = _mint_id_token(
+            rsa_keypair, sub="usr_stranger", email="stranger@example.com"
+        )
+        session = self._login(provider, id_token)
+        assert isinstance(session, Session)
+        assert session.user_id == "usr_stranger"
+
+    # ---- allowed identity passes every path ------------------------------
+
+    def test_allowed_username_claim_passes_login(self, rsa_keypair):
+        provider = _make_provider(rsa_keypair, allowed_users=["alice"])
+        id_token = _mint_id_token(
+            rsa_keypair,
+            email=None,
+            extra_claims={"preferred_username": "alice"},
+        )
+        assert isinstance(self._login(provider, id_token), Session)
+
+    def test_allowed_match_is_case_insensitive(self, rsa_keypair):
+        provider = _make_provider(rsa_keypair, allowed_users=["Alice"])
+        id_token = _mint_id_token(
+            rsa_keypair,
+            email=None,
+            extra_claims={"preferred_username": "ALICE"},
+        )
+        assert isinstance(self._login(provider, id_token), Session)
+
+    def test_allowed_by_full_email(self, rsa_keypair):
+        provider = _make_provider(
+            rsa_keypair, allowed_users=["alice@example.com"]
+        )
+        id_token = _mint_id_token(rsa_keypair, email="alice@example.com")
+        assert isinstance(self._login(provider, id_token), Session)
+
+    def test_allowed_by_email_local_part(self, rsa_keypair):
+        """A bare-username allowlist matches an IDP that only returns email."""
+        provider = _make_provider(rsa_keypair, allowed_users=["alice"])
+        id_token = _mint_id_token(rsa_keypair, email="alice@example.com")
+        assert isinstance(self._login(provider, id_token), Session)
+
+    # ---- denied identity is refused on every path ------------------------
+
+    def test_denied_login_raises_invalid_code(self, rsa_keypair):
+        """Login denial must surface as a 400-class error, NOT a 503.
+
+        ``complete_login`` passes ``InvalidCodeError`` as its bad-request
+        exception; the auth route turns that into a 400. A ``ProviderError``
+        would become a 503 "provider unreachable", which is both wrong and
+        unclearable by the user.
+        """
+        provider = _make_provider(rsa_keypair, allowed_users=["alice"])
+        id_token = _mint_id_token(
+            rsa_keypair, sub="usr_bob", email="bob@example.com"
+        )
+        with pytest.raises(InvalidCodeError):
+            self._login(provider, id_token)
+
+    def test_denied_login_does_not_raise_provider_error(self, rsa_keypair):
+        """Guard the 503 regression explicitly."""
+        provider = _make_provider(rsa_keypair, allowed_users=["alice"])
+        id_token = _mint_id_token(rsa_keypair, email="bob@example.com")
+        with pytest.raises(InvalidCodeError):
+            self._login(provider, id_token)
+        # ProviderError is NOT a parent of InvalidCodeError — assert they are
+        # genuinely distinct so this test can't silently pass on a refactor.
+        assert not issubclass(InvalidCodeError, ProviderError)
+
+    def test_denied_verify_session_returns_none(self, rsa_keypair):
+        """Per-request revocation: the contract requires None, not an exception.
+
+        This is the path that revokes access for a user removed from the
+        allowlist mid-session — the middleware logs them out instead of
+        serving a 503.
+        """
+        provider = _make_provider(rsa_keypair, allowed_users=["alice"])
+        id_token = _mint_id_token(rsa_keypair, email="bob@example.com")
+        assert provider.verify_session(access_token=id_token) is None
+
+    def test_allowed_verify_session_returns_session(self, rsa_keypair):
+        provider = _make_provider(rsa_keypair, allowed_users=["alice"])
+        id_token = _mint_id_token(rsa_keypair, email="alice@example.com")
+        session = provider.verify_session(access_token=id_token)
+        assert isinstance(session, Session)
+
+    def test_denied_refresh_raises_refresh_expired(self, rsa_keypair):
+        """Refresh denial must be RefreshExpiredError so cookies are cleared.
+
+        ``refresh_session`` passes ``RefreshExpiredError`` as its bad-request
+        exception. The middleware treats that as "this provider rejects the
+        token" and forces re-login — the correct outcome for a user pulled
+        from the allowlist. A ProviderError would yield a 503 and *preserve*
+        the cookies.
+        """
+        provider = _make_provider(rsa_keypair, allowed_users=["alice"])
+        id_token = _mint_id_token(rsa_keypair, email="bob@example.com")
+        with patch(
+            "plugins.dashboard_auth.self_hosted.httpx.post",
+            return_value=self._token_response(id_token, "rt_rotated"),
+        ):
+            with pytest.raises(RefreshExpiredError):
+                provider.refresh_session(refresh_token="rt_initial")
+
+    def test_denied_when_no_identity_claims_present(self, rsa_keypair):
+        """An allowlist with nothing to match against must FAIL CLOSED."""
+        provider = _make_provider(rsa_keypair, allowed_users=["alice"])
+        id_token = _mint_id_token(rsa_keypair, email=None, name=None)
+        with pytest.raises(InvalidCodeError):
+            self._login(provider, id_token)
+
+    def test_substring_does_not_match(self, rsa_keypair):
+        """Matching is exact per candidate — no accidental prefix/substring."""
+        provider = _make_provider(rsa_keypair, allowed_users=["alice"])
+        id_token = _mint_id_token(
+            rsa_keypair,
+            email=None,
+            extra_claims={"preferred_username": "alice2"},
+        )
+        with pytest.raises(InvalidCodeError):
+            self._login(provider, id_token)
+
+    def test_denial_does_not_log_email(self, rsa_keypair, caplog):
+        """PII hygiene: the denial log names the sub, never the email."""
+        provider = _make_provider(rsa_keypair, allowed_users=["alice"])
+        id_token = _mint_id_token(
+            rsa_keypair, sub="usr_bob", email="bob@example.com"
+        )
+        with caplog.at_level("WARNING"):
+            with pytest.raises(InvalidCodeError):
+                self._login(provider, id_token)
+        assert "usr_bob" in caplog.text
+        assert "bob@example.com" not in caplog.text
+
+
+class TestAllowedUsersRegistration:
+    """register() wires the allowlist from config.yaml and the env bridge."""
+
+    @pytest.fixture(autouse=True)
+    def clear_env(self, monkeypatch):
+        for var in (
+            "HERMES_DASHBOARD_OIDC_ISSUER",
+            "HERMES_DASHBOARD_OIDC_CLIENT_ID",
+            "HERMES_DASHBOARD_OIDC_SCOPES",
+            "HERMES_DASHBOARD_OIDC_CLIENT_SECRET",
+            "HERMES_DASHBOARD_OIDC_ALLOWED_USERS",
+        ):
+            monkeypatch.delenv(var, raising=False)
+
+    @pytest.fixture
+    def patch_config(self, monkeypatch):
+        def _set(oauth_block):
+            cfg = {}
+            if oauth_block is not None:
+                cfg = {"dashboard": {"oauth": oauth_block}}
+            monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+
+        return _set
+
+    def _registered(self, ctx):
+        return ctx.register_dashboard_auth_provider.call_args.args[0]
+
+    def test_defaults_to_unrestricted(self, patch_config):
+        patch_config(
+            {"self_hosted": {"issuer": _ISSUER, "client_id": _CLIENT_ID}}
+        )
+        ctx = MagicMock()
+        oidc_plugin.register(ctx)
+        assert self._registered(ctx)._allowed_users == ()
+
+    def test_reads_list_from_config(self, patch_config):
+        patch_config(
+            {
+                "self_hosted": {
+                    "issuer": _ISSUER,
+                    "client_id": _CLIENT_ID,
+                    "allowed_users": ["Bob", "alice"],
+                }
+            }
+        )
+        ctx = MagicMock()
+        oidc_plugin.register(ctx)
+        assert self._registered(ctx)._allowed_users == ("alice", "bob")
+
+    def test_reads_csv_from_env(self, patch_config, monkeypatch):
+        patch_config(None)
+        monkeypatch.setenv("HERMES_DASHBOARD_OIDC_ISSUER", _ISSUER)
+        monkeypatch.setenv("HERMES_DASHBOARD_OIDC_CLIENT_ID", _CLIENT_ID)
+        monkeypatch.setenv(
+            "HERMES_DASHBOARD_OIDC_ALLOWED_USERS", "alice, bob"
+        )
+        ctx = MagicMock()
+        oidc_plugin.register(ctx)
+        assert self._registered(ctx)._allowed_users == ("alice", "bob")
+
+    def test_env_overrides_config(self, patch_config, monkeypatch):
+        patch_config(
+            {
+                "self_hosted": {
+                    "issuer": _ISSUER,
+                    "client_id": _CLIENT_ID,
+                    "allowed_users": ["carol"],
+                }
+            }
+        )
+        monkeypatch.setenv("HERMES_DASHBOARD_OIDC_ALLOWED_USERS", "alice")
+        ctx = MagicMock()
+        oidc_plugin.register(ctx)
+        assert self._registered(ctx)._allowed_users == ("alice",)
+
+    def test_empty_env_does_not_shadow_config(self, patch_config, monkeypatch):
+        """Mirrors the client_secret precedence rule."""
+        patch_config(
+            {
+                "self_hosted": {
+                    "issuer": _ISSUER,
+                    "client_id": _CLIENT_ID,
+                    "allowed_users": ["carol"],
+                }
+            }
+        )
+        monkeypatch.setenv("HERMES_DASHBOARD_OIDC_ALLOWED_USERS", "")
+        ctx = MagicMock()
+        oidc_plugin.register(ctx)
+        assert self._registered(ctx)._allowed_users == ("carol",)
