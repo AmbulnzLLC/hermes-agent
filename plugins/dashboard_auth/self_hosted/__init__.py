@@ -58,9 +58,9 @@ same precedence convention as the ``nous`` plugin)::
           scopes: "openid profile email"                           # optional
           # client_secret: set ONLY for a confidential client. It is a
           # credential — prefer the env var / ~/.hermes/.env over config.yaml.
-          allowed_users:                                           # optional
-            - alice                                                # authorization
-            - bob@example.com                                      # allowlist
+          allowed_users:                # REQUIRED to authorize anyone.
+            - alice                     # Unset/empty => nobody authorized.
+            - bob@example.com           # Use ["*"] to allow every user.
 
     # Environment overrides (Docker/Fly secret injection)
     HERMES_DASHBOARD_OIDC_ISSUER
@@ -69,20 +69,30 @@ same precedence convention as the ``nous`` plugin)::
     HERMES_DASHBOARD_OIDC_CLIENT_SECRET # optional; set for a confidential client
                                         # (the .env file is the canonical home —
                                         # it's a secret, not a behavioural setting)
-    HERMES_DASHBOARD_OIDC_ALLOWED_USERS # optional; comma/space separated. Bridge
-                                        # for orchestrators that inject per-pod
-                                        # identity as env; config.yaml is canonical
+    HERMES_DASHBOARD_OIDC_ALLOWED_USERS # comma/space separated. Bridge for
+                                        # orchestrators that inject per-pod
+                                        # identity as env; config.yaml is
+                                        # canonical. Unset => nobody authorized.
 
-**Authentication vs authorization.** By default this provider authorizes every
-identity the IDP authenticates — correct for a single-tenant dashboard, but on
-a *shared* IDP (one realm, many dashboards) it means any realm user can sign
-in to any dashboard. Setting ``allowed_users`` adds a local authorization
-allowlist matched case-insensitively against the verified ``preferred_username``
-and ``email`` claims (plus the email's local-part, so bare usernames match an
-IDP that only returns email). It is enforced in ``_session_from_tokens`` — the
-chokepoint shared by login, refresh, and the per-request ``verify_session`` —
-so removing a user takes effect on their next request, not just at next login.
-Empty/unset preserves the historical allow-all behaviour.
+**Authentication vs authorization — this provider FAILS CLOSED.** The IDP says
+*who* you are; ``allowed_users`` says *whether you may use this dashboard*. On a
+shared IDP (one realm, many dashboards) authentication alone would let any realm
+user sign in to any dashboard, so an allowlist is required rather than optional:
+
+* ``allowed_users`` set     ⇒ only those identities are authorized.
+* ``allowed_users`` **unset/empty** ⇒ **NOBODY is authorized.** Silence is not
+  consent — a missing env var, a typo'd config key or a chart that failed to
+  render the value would otherwise grant everyone access, invisibly. The boot
+  log warns, and each denial logs at ERROR with the remedy.
+* ``allowed_users: "*"``    ⇒ authorization deliberately disabled; every
+  authenticated identity is allowed. Single-tenant deployments that want the
+  old behaviour set this explicitly.
+
+Matching is case-insensitive against the verified ``preferred_username`` and
+``email`` claims (plus the email's local-part, so bare usernames match an IDP
+that only returns email). Enforced in ``_session_from_tokens`` — the chokepoint
+shared by login, refresh, and the per-request ``verify_session`` — so removing a
+user takes effect on their next request, not just at next login.
 
 Skip reasons: when the plugin loads but can't register (missing issuer /
 client_id), it writes a human-readable reason to the module-level
@@ -168,14 +178,24 @@ class AuthorizationDeniedError(Exception):
     """
 
 
+# Explicit opt-out of authorization. Because an unset/empty allowlist DENIES
+# (fail-closed), "let every authenticated identity in" has to be stated on
+# purpose — a deployment that genuinely wants realm-wide access sets this.
+# A single "*" entry is the whole allowlist; it is never combined with names.
+_ALLOW_ALL_SENTINEL = "*"
+
+
 def _parse_allowed_users(raw: Any) -> tuple[str, ...]:
     """Normalise the allowlist into a lowercase tuple.
 
     Accepts a list (config.yaml's natural shape) or a comma/whitespace
     separated string (the env-var shape). Entries are lowercased and stripped;
-    empties are dropped. An empty result means "no allowlist" — the provider
-    then authorizes every authenticated identity, which is the historical
-    behaviour and therefore the default.
+    empties are dropped.
+
+    An empty result means **no allowlist configured**, which this provider
+    treats as "authorize nobody" — see :meth:`_authorize_claims`. To
+    deliberately authorize every authenticated identity, set the explicit
+    :data:`_ALLOW_ALL_SENTINEL` (``"*"``) rather than leaving this empty.
     """
     if raw is None:
         return ()
@@ -743,6 +763,13 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
     def _authorize_claims(self, claims: Dict[str, Any]) -> None:
         """Enforce the local allowlist against verified claims.
 
+        **Fail-closed.** An unset/empty allowlist authorizes NOBODY. Silence
+        must not mean "let everyone in": a missing env var, a typo'd config
+        key, or a chart that failed to render the value would otherwise
+        quietly grant every authenticated identity access to this dashboard,
+        with nothing in the logs to show it. To genuinely allow all, set the
+        explicit ``"*"`` sentinel.
+
         Called from ``_session_from_tokens`` — the single chokepoint every
         Session flows through (auth-code exchange, refresh, and the
         per-request ``verify_session``) — so a revoked user loses access on
@@ -753,8 +780,27 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         ID token that already passed signature/issuer/audience verification
         reach here, so these values are trustworthy.
         """
-        if not self._allowed_users:
+        # Explicit, deliberate opt-out: authorization disabled by configuration.
+        if _ALLOW_ALL_SENTINEL in self._allowed_users:
             return
+
+        if not self._allowed_users:
+            # Fail closed, and say so loudly — this is a misconfiguration in
+            # every deployment that did not mean it, and the symptom
+            # (nobody can log in) is otherwise hard to attribute.
+            logger.error(
+                "dashboard-auth-self-hosted: denying authenticated identity "
+                "sub=%s — no allowed_users configured, so NOBODY is "
+                "authorized. Set dashboard.oauth.self_hosted.allowed_users "
+                "(or HERMES_DASHBOARD_OIDC_ALLOWED_USERS) to the permitted "
+                "identities, or to %r to allow every authenticated user.",
+                claims.get("sub", "<unknown>"),
+                _ALLOW_ALL_SENTINEL,
+            )
+            raise AuthorizationDeniedError(
+                "no allowed_users configured — this dashboard authorizes "
+                "nobody until an allowlist is set"
+            )
 
         candidates = set()
         for claim in ("preferred_username", "email"):
@@ -988,6 +1034,21 @@ def register(ctx) -> None:
         return
 
     ctx.register_dashboard_auth_provider(provider)
+    if _ALLOW_ALL_SENTINEL in allowed_users:
+        authz_desc = "DISABLED (explicit '*' — every authenticated user allowed)"
+    elif allowed_users:
+        authz_desc = f"{len(allowed_users)} entries"
+    else:
+        # Fail-closed default. Warn separately: at INFO this would scroll past,
+        # and the resulting symptom is a total login outage.
+        authz_desc = "NONE CONFIGURED — nobody authorized (fail-closed)"
+        logger.warning(
+            "dashboard-auth-self-hosted: no allowed_users configured — this "
+            "dashboard will authenticate users but authorize NOBODY. Set "
+            "dashboard.oauth.self_hosted.allowed_users (or "
+            "HERMES_DASHBOARD_OIDC_ALLOWED_USERS), or %r to allow everyone.",
+            _ALLOW_ALL_SENTINEL,
+        )
     logger.info(
         "dashboard-auth-self-hosted: registered provider "
         "(issuer=%s, client_id=%s, scopes=%r, confidential=%s, "
@@ -997,8 +1058,5 @@ def register(ctx) -> None:
         scopes,
         # Log only whether a secret is present, never the secret itself.
         bool(client_secret),
-        # Count, not the identities themselves. "unrestricted" is called out
-        # explicitly so an operator who *intended* an allowlist but misspelled
-        # the key sees it in the boot log instead of silently allowing everyone.
-        f"{len(allowed_users)} entries" if allowed_users else "unrestricted",
+        authz_desc,
     )

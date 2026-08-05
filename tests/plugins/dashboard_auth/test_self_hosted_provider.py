@@ -133,7 +133,7 @@ def _make_provider(
     scopes: str | None = None,
     client_secret: str | None = None,
     auth_methods: Any = "__unset__",
-    allowed_users: Any = None,
+    allowed_users: Any = "*",
 ):
     """Construct a provider with discovery + JWKS stubbed (no network).
 
@@ -141,8 +141,11 @@ def _make_provider(
     overrides ``token_endpoint_auth_methods_supported`` in the seeded discovery
     doc (pass a list, or ``None`` to omit the key entirely); left unset, the
     discovery doc carries no auth-methods key (the absent-key default).
-    ``allowed_users`` enables the local authorization allowlist; ``None``
-    (the default) leaves it unrestricted.
+
+    ``allowed_users`` defaults to the ``"*"`` allow-all sentinel so tests that
+    are not about authorization are unaffected by the fail-closed default.
+    Pass a list to exercise the allowlist, or ``None`` to leave it unset and
+    get the fail-closed (deny-everyone) behaviour.
     """
     kwargs: Dict[str, Any] = {"issuer": _ISSUER, "client_id": _CLIENT_ID}
     if scopes is not None:
@@ -804,16 +807,83 @@ class TestAuthorizationEnforcement:
                 redirect_uri="https://hermes.example/auth/callback",
             )
 
-    # ---- default (no allowlist) is unchanged behaviour --------------------
+    # ---- fail-closed default ----------------------------------------------
 
-    def test_no_allowlist_authorizes_everyone(self, rsa_keypair):
-        provider = _make_provider(rsa_keypair)
+    def test_no_allowlist_authorizes_NOBODY(self, rsa_keypair):
+        """Unset allowlist must DENY, not allow.
+
+        Silence is not consent: a missing env var or typo'd config key must not
+        silently grant every authenticated identity access.
+        """
+        provider = _make_provider(rsa_keypair, allowed_users=None)
         id_token = _mint_id_token(
             rsa_keypair, sub="usr_stranger", email="stranger@example.com"
         )
-        session = self._login(provider, id_token)
-        assert isinstance(session, Session)
-        assert session.user_id == "usr_stranger"
+        with pytest.raises(InvalidCodeError):
+            self._login(provider, id_token)
+
+    def test_no_allowlist_denies_even_a_plausible_user(self, rsa_keypair):
+        """Fail-closed applies to everyone — there is no implicit owner."""
+        provider = _make_provider(rsa_keypair, allowed_users=None)
+        id_token = _mint_id_token(
+            rsa_keypair,
+            email=None,
+            extra_claims={"preferred_username": "alice"},
+        )
+        with pytest.raises(InvalidCodeError):
+            self._login(provider, id_token)
+
+    def test_empty_list_denies(self, rsa_keypair):
+        """An explicitly empty list is still 'nothing configured' => deny."""
+        provider = _make_provider(rsa_keypair, allowed_users=[])
+        id_token = _mint_id_token(rsa_keypair, email="alice@example.com")
+        with pytest.raises(InvalidCodeError):
+            self._login(provider, id_token)
+
+    def test_unset_allowlist_denies_verify_session(self, rsa_keypair):
+        """The per-request path must fail closed too, returning None."""
+        provider = _make_provider(rsa_keypair, allowed_users=None)
+        id_token = _mint_id_token(rsa_keypair, email="alice@example.com")
+        assert provider.verify_session(access_token=id_token) is None
+
+    def test_unset_allowlist_logs_actionable_error(self, rsa_keypair, caplog):
+        """The remedy must be in the log — the symptom is a total login outage."""
+        provider = _make_provider(rsa_keypair, allowed_users=None)
+        id_token = _mint_id_token(rsa_keypair, email="alice@example.com")
+        with caplog.at_level("ERROR"):
+            with pytest.raises(InvalidCodeError):
+                self._login(provider, id_token)
+        assert "no allowed_users configured" in caplog.text
+        # Must name the config key AND the allow-all escape hatch.
+        assert "allowed_users" in caplog.text
+        assert "'*'" in caplog.text or '"*"' in caplog.text
+
+    # ---- explicit allow-all opt-out ---------------------------------------
+
+    def test_star_sentinel_authorizes_everyone(self, rsa_keypair):
+        """'*' is the deliberate opt-out for single-tenant deployments."""
+        provider = _make_provider(rsa_keypair, allowed_users=["*"])
+        id_token = _mint_id_token(
+            rsa_keypair, sub="usr_stranger", email="stranger@example.com"
+        )
+        assert isinstance(self._login(provider, id_token), Session)
+
+    def test_star_sentinel_from_env_string(self, rsa_keypair):
+        """The env-var shape ('*') must reach the same code path."""
+        provider = _make_provider(rsa_keypair, allowed_users="*")
+        id_token = _mint_id_token(rsa_keypair, email="anyone@example.com")
+        assert isinstance(self._login(provider, id_token), Session)
+
+    def test_star_wins_when_mixed_with_names(self, rsa_keypair):
+        """A '*' anywhere in the list disables authorization.
+
+        Pinned deliberately: the sentinel is checked before the membership
+        test, so ["*", "alice"] allows everyone rather than just alice. An
+        operator who wants only alice must not include '*'.
+        """
+        provider = _make_provider(rsa_keypair, allowed_users=["*", "alice"])
+        id_token = _mint_id_token(rsa_keypair, email="bob@example.com")
+        assert isinstance(self._login(provider, id_token), Session)
 
     # ---- allowed identity passes every path ------------------------------
 
@@ -968,13 +1038,33 @@ class TestAllowedUsersRegistration:
     def _registered(self, ctx):
         return ctx.register_dashboard_auth_provider.call_args.args[0]
 
-    def test_defaults_to_unrestricted(self, patch_config):
+    def test_defaults_to_empty_which_means_deny_all(self, patch_config):
+        """No allowlist configured => empty tuple => fail-closed at auth time.
+
+        Registration still succeeds (the provider must come up so /login and
+        the boot warning are reachable); it is _authorize_claims that denies.
+        """
         patch_config(
             {"self_hosted": {"issuer": _ISSUER, "client_id": _CLIENT_ID}}
         )
         ctx = MagicMock()
         oidc_plugin.register(ctx)
         assert self._registered(ctx)._allowed_users == ()
+
+    def test_star_sentinel_survives_parsing(self, patch_config):
+        """'*' must reach the provider intact, not be stripped as junk."""
+        patch_config(
+            {
+                "self_hosted": {
+                    "issuer": _ISSUER,
+                    "client_id": _CLIENT_ID,
+                    "allowed_users": ["*"],
+                }
+            }
+        )
+        ctx = MagicMock()
+        oidc_plugin.register(ctx)
+        assert self._registered(ctx)._allowed_users == ("*",)
 
     def test_reads_list_from_config(self, patch_config):
         patch_config(
