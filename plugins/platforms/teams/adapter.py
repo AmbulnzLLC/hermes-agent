@@ -6,7 +6,8 @@ Runs an aiohttp webhook server to receive messages from Teams.
 Proactive messaging (send, typing) uses the SDK's App.send() method.
 
 Requires:
-    pip install microsoft-teams-apps aiohttp
+    the ``teams`` extra (auto-installed by the gateway on first start, or
+    manually: ``<hermes-venv>/bin/pip install microsoft-teams-apps aiohttp``)
     TEAMS_CLIENT_ID, TEAMS_CLIENT_SECRET, and TEAMS_TENANT_ID env vars
 
 Configuration in config.yaml:
@@ -28,6 +29,7 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 from collections import OrderedDict
 from contextlib import contextmanager
@@ -440,7 +442,22 @@ def _suppress_third_party_dotenv() -> Iterator[None]:
 
 
 def check_requirements() -> bool:
-    """Return True when all Teams dependencies and credentials are present.
+    """PASSIVE probe: are the Teams SDK and aiohttp importable right now?
+
+    Never installs anything — credentials are gated separately via
+    ``is_connected``/``validate_config``.  The ACTIVE lazy-installer is
+    ``check_teams_requirements`` (registered as ``ensure_deps_fn``).
+    """
+    return TEAMS_SDK_AVAILABLE and AIOHTTP_AVAILABLE
+
+
+def check_teams_requirements() -> bool:
+    """ACTIVE lazy-installer: ensure the Teams SDK is importable, installing on demand.
+
+    Registered as ``ensure_deps_fn`` (#79812) — the registry's
+    ``create_adapter()`` runs this when the passive ``check_requirements``
+    probe returns False, right before the gateway connects Teams;
+    ``connect()`` re-checks defensively.
 
     Lazy-installs microsoft-teams-apps via ``tools.lazy_deps.ensure("platform.teams")``
     on first call if not present, following the same pattern as check_slack_requirements().
@@ -452,72 +469,86 @@ def check_requirements() -> bool:
     NOT ``TEAMS_SDK_AVAILABLE`` (merely installed); the latter is True from
     ``find_spec`` before any import has run. The SDK import runs behind
     ``_suppress_third_party_dotenv()`` so it can't pollute ``os.environ``.
-    """
-    global TEAMS_SDK_AVAILABLE, AIOHTTP_AVAILABLE, web
-    global App, ActivityContext, ClientOptions, MessageActivity, ConversationReference
-    global TypingActivityInput, AdaptiveCardInvokeActivity
-    global FileConsentInvokeActivity, FileUploadInfo
-    global AdaptiveCardActionCardResponse, AdaptiveCardActionMessageResponse
-    global InvokeResponse, AdaptiveCardInvokeResponse
-    global HttpMethod, HttpRequest, HttpResponse, HttpRouteHandler
-    global AdaptiveCard, ExecuteAction, TextBlock
-    global Choice, ChoiceSetInput
 
+    Binding goes through ``tools.lazy_deps.ensure_and_bind`` (upstream's
+    canonical shape) so every symbol is rebound from one dict — this is what
+    prevents the ``NameError: ChoiceSetInput`` class of bug where a new symbol
+    is imported but its module-global assignment is forgotten.
+    """
     if App is not None and AIOHTTP_AVAILABLE:
         return True
-    try:
-        from tools.lazy_deps import ensure as _lazy_ensure
-        _lazy_ensure("platform.teams", prompt=False)
-    except Exception:
-        return False
-    try:
+
+    def _import() -> dict:
         from aiohttp import web as _web
 
         with _suppress_third_party_dotenv():
-            from microsoft_teams.apps import App as _App, ActivityContext as _ActivityContext
-            from microsoft_teams.common.http.client import ClientOptions as _ClientOptions
-            from microsoft_teams.api import MessageActivity as _MessageActivity, ConversationReference as _ConversationReference
-            from microsoft_teams.api.activities.typing import TypingActivityInput as _TypingActivityInput
-            from microsoft_teams.api.activities.invoke.adaptive_card import AdaptiveCardInvokeActivity as _AdaptiveCardInvokeActivity
-            from microsoft_teams.api.activities.invoke.file_consent import FileConsentInvokeActivity as _FileConsentInvokeActivity
-            from microsoft_teams.api.models import FileUploadInfo as _FileUploadInfo
+            from microsoft_teams.apps import App, ActivityContext
+            from microsoft_teams.common.http.client import ClientOptions
+            from microsoft_teams.api import MessageActivity, ConversationReference
+            from microsoft_teams.api.activities.typing import TypingActivityInput
+            from microsoft_teams.api.activities.invoke.adaptive_card import (
+                AdaptiveCardInvokeActivity,
+            )
+            # Fork-only: outbound FileConsent (SharePoint/OneDrive) delivery.
+            from microsoft_teams.api.activities.invoke.file_consent import (
+                FileConsentInvokeActivity,
+            )
+            from microsoft_teams.api.models import FileUploadInfo
             from microsoft_teams.api.models.adaptive_card import (
-                AdaptiveCardActionCardResponse as _AdaptiveCardActionCardResponse,
-                AdaptiveCardActionMessageResponse as _AdaptiveCardActionMessageResponse,
+                AdaptiveCardActionCardResponse,
+                AdaptiveCardActionMessageResponse,
             )
-            from microsoft_teams.api.models.invoke_response import InvokeResponse as _InvokeResponse, AdaptiveCardInvokeResponse as _AdaptiveCardInvokeResponse
+            from microsoft_teams.api.models.invoke_response import (
+                InvokeResponse,
+                AdaptiveCardInvokeResponse,
+            )
             from microsoft_teams.apps.http.adapter import (
-                HttpMethod as _HttpMethod,
-                HttpRequest as _HttpRequest,
-                HttpResponse as _HttpResponse,
-                HttpRouteHandler as _HttpRouteHandler,
+                HttpMethod,
+                HttpRequest,
+                HttpResponse,
+                HttpRouteHandler,
             )
+            # Fork-only: Choice/ChoiceSetInput back the clarify Adaptive Card's
+            # long-label ChoiceSet branch.
             from microsoft_teams.cards import (
-                AdaptiveCard as _AdaptiveCard,
-                Choice as _Choice,
-                ChoiceSetInput as _ChoiceSetInput,
-                ExecuteAction as _ExecuteAction,
-                TextBlock as _TextBlock,
+                AdaptiveCard,
+                Choice,
+                ChoiceSetInput,
+                ExecuteAction,
+                TextBlock,
             )
-    except ImportError:
-        return False
-    web = _web
-    App, ActivityContext, ClientOptions = _App, _ActivityContext, _ClientOptions
-    MessageActivity, ConversationReference = _MessageActivity, _ConversationReference
-    TypingActivityInput = _TypingActivityInput
-    AdaptiveCardInvokeActivity = _AdaptiveCardInvokeActivity
-    FileConsentInvokeActivity = _FileConsentInvokeActivity
-    FileUploadInfo = _FileUploadInfo
-    AdaptiveCardActionCardResponse = _AdaptiveCardActionCardResponse
-    AdaptiveCardActionMessageResponse = _AdaptiveCardActionMessageResponse
-    InvokeResponse, AdaptiveCardInvokeResponse = _InvokeResponse, _AdaptiveCardInvokeResponse
-    HttpMethod, HttpRequest = _HttpMethod, _HttpRequest
-    HttpResponse, HttpRouteHandler = _HttpResponse, _HttpRouteHandler
-    AdaptiveCard, ExecuteAction, TextBlock = _AdaptiveCard, _ExecuteAction, _TextBlock
-    Choice, ChoiceSetInput = _Choice, _ChoiceSetInput
-    AIOHTTP_AVAILABLE = True
-    TEAMS_SDK_AVAILABLE = True
-    return True
+
+        return {
+            "web": _web,
+            "AIOHTTP_AVAILABLE": True,
+            "App": App,
+            "ActivityContext": ActivityContext,
+            "ClientOptions": ClientOptions,
+            "MessageActivity": MessageActivity,
+            "ConversationReference": ConversationReference,
+            "TypingActivityInput": TypingActivityInput,
+            "AdaptiveCardInvokeActivity": AdaptiveCardInvokeActivity,
+            "FileConsentInvokeActivity": FileConsentInvokeActivity,
+            "FileUploadInfo": FileUploadInfo,
+            "AdaptiveCardActionCardResponse": AdaptiveCardActionCardResponse,
+            "AdaptiveCardActionMessageResponse": AdaptiveCardActionMessageResponse,
+            "InvokeResponse": InvokeResponse,
+            "AdaptiveCardInvokeResponse": AdaptiveCardInvokeResponse,
+            "HttpMethod": HttpMethod,
+            "HttpRequest": HttpRequest,
+            "HttpResponse": HttpResponse,
+            "HttpRouteHandler": HttpRouteHandler,
+            "AdaptiveCard": AdaptiveCard,
+            "Choice": Choice,
+            "ChoiceSetInput": ChoiceSetInput,
+            "ExecuteAction": ExecuteAction,
+            "TextBlock": TextBlock,
+            "TEAMS_SDK_AVAILABLE": True,
+        }
+
+    from tools.lazy_deps import ensure_and_bind
+
+    return ensure_and_bind("platform.teams", _import, globals(), prompt=False)
 
 
 def validate_config(config) -> bool:
@@ -740,8 +771,12 @@ async def _standalone_send(
         return {"error": f"Teams standalone send failed: {e}"}
 
 
-# Keep the old name as an alias so existing test imports don't break.
-check_teams_requirements = check_requirements
+# NOTE: ``check_requirements`` is the PASSIVE probe (registry ``check_fn``,
+# status / unit tests) — it must never trigger a pip install.
+# ``check_teams_requirements`` is the ACTIVE lazy-installer, registered as
+# ``ensure_deps_fn``: the registry's ``create_adapter()`` runs it when the
+# passive probe fails, right before the gateway connects Teams (#79812).
+# ``connect()`` re-checks defensively.
 
 
 _HOSTED_CONTENT_RE = re.compile(
@@ -963,16 +998,18 @@ class TeamsAdapter(BasePlatformAdapter):
         self._token_provider: Any = None
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
-        # SDK symbols are no longer imported eagerly at module load (find_spec
-        # detection only, to avoid .env pollution — #62935). Bind them now via
-        # the lazy-install path, which also installs microsoft-teams-apps on
-        # first use (parity with Slack/Discord/etc.), then re-check the module
-        # globals it rebinds.
-        check_requirements()
+        # Defensive re-check: create_adapter() already ran the installer
+        # (ensure_deps_fn) if deps were missing, but connect() can also be
+        # reached via reconnect paths — re-run to bind SDK globals.
+        # NB: guard on ``App is None`` as well as the flag — SDK *presence* is
+        # detected via find_spec at import time (#62935), so TEAMS_SDK_AVAILABLE
+        # can be True before any import has actually bound the symbols.
+        check_teams_requirements()
         if App is None or not TEAMS_SDK_AVAILABLE:
             self._set_fatal_error(
                 "MISSING_SDK",
-                "microsoft-teams-apps could not be installed. Run: pip install microsoft-teams-apps",
+                "microsoft-teams-apps could not be installed. "
+                f"Run: {sys.executable} -m pip install microsoft-teams-apps",
                 retryable=False,
             )
             return False
@@ -980,7 +1017,7 @@ class TeamsAdapter(BasePlatformAdapter):
         if not AIOHTTP_AVAILABLE:
             self._set_fatal_error(
                 "MISSING_SDK",
-                "aiohttp not installed. Run: pip install aiohttp",
+                f"aiohttp not installed. Run: {sys.executable} -m pip install aiohttp",
                 retryable=False,
             )
             return False
@@ -2788,17 +2825,41 @@ def interactive_setup() -> None:
 
 # ── Plugin entry point ────────────────────────────────────────────────────────
 
+def _install_hint() -> str:
+    """Build the Teams install hint from the canonical LAZY_DEPS pins.
+
+    Derived (not hardcoded) so a pin bump in ``tools/lazy_deps.py`` — aiohttp
+    is CVE-pinned, so bumps happen — never leaves this string stale.
+    ``feature_install_command(venv_pip=True)`` targets the actual Hermes
+    venv in every layout and sidesteps Ubuntu 24.04's PEP 668 failure that
+    a bare ``pip install`` hint invites.
+    """
+    try:
+        from tools.lazy_deps import feature_install_command
+        cmd = feature_install_command("platform.teams", venv_pip=True)
+    except Exception:  # pragma: no cover — defensive
+        cmd = None
+    if not cmd:
+        cmd = f"{sys.executable} -m pip install microsoft-teams-apps aiohttp"
+    return f"Teams SDK missing — restart the gateway to auto-install, or run: {cmd}"
+
+
 def register(ctx) -> None:
     """Plugin entry point — called by the Hermes plugin system."""
     ctx.register_platform(
         name="teams",
         label="Microsoft Teams",
         adapter_factory=lambda cfg: TeamsAdapter(cfg),
+        # PASSIVE probe — deps importable right now?  Never installs, so
+        # status displays / config loading can call it freely.
         check_fn=check_requirements,
+        # ACTIVE lazy-installer — create_adapter() calls this when check_fn
+        # is False, right before the gateway connects Teams (#79812).
+        ensure_deps_fn=check_teams_requirements,
         validate_config=validate_config,
         is_connected=is_connected,
         required_env=["TEAMS_CLIENT_ID", "TEAMS_CLIENT_SECRET", "TEAMS_TENANT_ID"],
-        install_hint="pip install microsoft-teams-apps aiohttp",
+        install_hint=_install_hint(),
         setup_fn=interactive_setup,
         # Env-driven auto-configuration — seeds PlatformConfig.extra with
         # client_id/secret/tenant + port + home_channel so env-only setups

@@ -17,15 +17,15 @@ def _bind_teams_sdk_symbols():
 
     The adapter no longer imports the SDK eagerly at module load — it detects
     presence via ``find_spec`` and binds the real symbols lazily in
-    ``check_requirements()`` (the #62935 .env-pollution fix). Card-rendering
+    ``check_teams_requirements()`` (the #62935 .env-pollution fix). Card-rendering
     paths (``send_clarify``, ``_on_clarify_action``) dereference module globals
     like ``AdaptiveCard`` / ``TextBlock`` / ``Choice`` / ``ChoiceSetInput`` that
     stay ``None`` until that runs. In production ``connect()`` binds them first;
-    here we call ``check_requirements()`` to reproduce that state. Tests that
+    here we call ``check_teams_requirements()`` to reproduce that state. Tests that
     assert on the unbound state (see ``TestLateImportBindings``) manage their
     own globals via monkeypatch, which pytest restores on teardown.
     """
-    teams_adapter_module.check_requirements()
+    teams_adapter_module.check_teams_requirements()
     yield
 
 
@@ -622,7 +622,7 @@ class TestLateImportBindings:
     """The Teams adapter has TWO import paths for microsoft_teams.cards symbols:
 
     1. Top-level ``try/except ImportError`` at module load time.
-    2. ``check_requirements()`` re-imports + re-binds the names when the
+    2. ``check_teams_requirements()`` re-imports + re-binds the names when the
        lazy-deps installer pulls them in for deferred init.
 
     Whatever ``send_clarify`` references at runtime MUST be bound to the module
@@ -634,7 +634,7 @@ class TestLateImportBindings:
     def test_late_init_binds_all_card_symbols_used_by_send_clarify(self):
         # If the deferred init succeeds in this test environment, all the
         # symbols send_clarify dereferences must be bound to module globals.
-        result = teams_adapter_module.check_requirements()
+        result = teams_adapter_module.check_teams_requirements()
         if not result:
             pytest.skip("microsoft_teams SDK not available in this env")
 
@@ -647,13 +647,13 @@ class TestLateImportBindings:
         )
         missing = [n for n in required if getattr(teams_adapter_module, n, None) is None]
         assert not missing, (
-            f"check_requirements() failed to bind: {missing}. "
+            f"check_teams_requirements() failed to bind: {missing}. "
             "Add the import to the deferred-init block AND the assignment line "
             "(see plugins/platforms/teams/adapter.py around lines 446 and 461)."
         )
 
-    def test_check_requirements_rebinds_globals_after_clear(self, monkeypatch):
-        """Regression: ``check_requirements()`` must rebind module globals via
+    def test_check_teams_requirements_rebinds_globals_after_clear(self, monkeypatch):
+        """Regression: ``check_teams_requirements()`` must rebind module globals via
         the ``global`` declaration, not just create local variables.
 
         The original deferred-init fix added ``Choice, ChoiceSetInput =
@@ -661,7 +661,7 @@ class TestLateImportBindings:
         the assignments only set locals and the module namespace remained
         unchanged — reproducing the production NameError. This test simulates
         the deferred path by clearing the globals first, then calling
-        ``check_requirements()``, and asserts the names reappear.
+        ``check_teams_requirements()``, and asserts the names reappear.
         """
         # Skip if SDK isn't installed in this environment
         if not getattr(teams_adapter_module, "TEAMS_SDK_AVAILABLE", False):
@@ -680,13 +680,13 @@ class TestLateImportBindings:
             )
 
         # Now invoke the deferred-init path
-        ok = teams_adapter_module.check_requirements()
-        assert ok, "check_requirements() returned False after clearing globals"
+        ok = teams_adapter_module.check_teams_requirements()
+        assert ok, "check_teams_requirements() returned False after clearing globals"
 
         # All symbols must be re-bound to non-None values
         unbound = [n for n in symbols if getattr(teams_adapter_module, n, None) is None]
         assert not unbound, (
-            f"check_requirements() did not rebind module globals: {unbound}. "
+            f"check_teams_requirements() did not rebind module globals: {unbound}. "
             "This usually means the assignment is missing a ``global`` declaration "
             "at the top of the function — the assignment becomes a local instead "
             "of updating module state."

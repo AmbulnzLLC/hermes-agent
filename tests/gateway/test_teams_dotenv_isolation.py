@@ -55,8 +55,17 @@ def _install_fake_teams_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
         "AdaptiveCardInvokeActivity", (), {}
     )
 
+    # Fork-only: outbound FileConsent (SharePoint/OneDrive) delivery symbols.
+    api_invoke_file_consent = types.ModuleType(
+        "microsoft_teams.api.activities.invoke.file_consent"
+    )
+    api_invoke_file_consent.FileConsentInvokeActivity = type(
+        "FileConsentInvokeActivity", (), {}
+    )
+
     api_models = types.ModuleType("microsoft_teams.api.models")
     api_models.__path__ = []  # type: ignore[attr-defined]
+    api_models.FileUploadInfo = type("FileUploadInfo", (), {})
     api_models_card = types.ModuleType("microsoft_teams.api.models.adaptive_card")
     api_models_card.AdaptiveCardActionCardResponse = type(
         "AdaptiveCardActionCardResponse", (), {}
@@ -84,6 +93,9 @@ def _install_fake_teams_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
     cards.AdaptiveCard = type("AdaptiveCard", (), {})
     cards.ExecuteAction = type("ExecuteAction", (), {})
     cards.TextBlock = type("TextBlock", (), {})
+    # Fork-only: back the clarify Adaptive Card's long-label ChoiceSet branch.
+    cards.Choice = type("Choice", (), {})
+    cards.ChoiceSetInput = type("ChoiceSetInput", (), {})
 
     for name, mod in {
         "microsoft_teams": microsoft_teams,
@@ -96,6 +108,7 @@ def _install_fake_teams_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
         "microsoft_teams.api.activities.typing": api_typing,
         "microsoft_teams.api.activities.invoke": api_invoke,
         "microsoft_teams.api.activities.invoke.adaptive_card": api_invoke_card,
+        "microsoft_teams.api.activities.invoke.file_consent": api_invoke_file_consent,
         "microsoft_teams.api.models": api_models,
         "microsoft_teams.api.models.adaptive_card": api_models_card,
         "microsoft_teams.api.models.invoke_response": api_models_invoke,

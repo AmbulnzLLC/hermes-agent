@@ -33,6 +33,10 @@ def _ensure_teams_mock():
     microsoft_teams_api_activities_invoke_adaptive_card = types.ModuleType(
         "microsoft_teams.api.activities.invoke.adaptive_card"
     )
+    # Fork-only: outbound FileConsent (SharePoint/OneDrive) delivery.
+    microsoft_teams_api_activities_invoke_file_consent = types.ModuleType(
+        "microsoft_teams.api.activities.invoke.file_consent"
+    )
     microsoft_teams_common = types.ModuleType("microsoft_teams.common")
     microsoft_teams_common_http = types.ModuleType("microsoft_teams.common.http")
     microsoft_teams_common_http_client = types.ModuleType("microsoft_teams.common.http.client")
@@ -124,6 +128,11 @@ def _ensure_teams_mock():
     microsoft_teams_cards.AdaptiveCard = MockAdaptiveCard
     microsoft_teams_cards.ExecuteAction = MagicMock
     microsoft_teams_cards.TextBlock = MagicMock
+    # Fork-only: back the clarify Adaptive Card's long-label ChoiceSet branch.
+    microsoft_teams_cards.Choice = MagicMock
+    microsoft_teams_cards.ChoiceSetInput = MagicMock
+    microsoft_teams_api_activities_invoke_file_consent.FileConsentInvokeActivity = MagicMock
+    microsoft_teams_api_models.FileUploadInfo = MagicMock
 
     # HttpRequest TypedDict mock
     def HttpRequest(body=None, headers=None):
@@ -149,6 +158,7 @@ def _ensure_teams_mock():
         "microsoft_teams.api.activities.typing": microsoft_teams_api_activities_typing,
         "microsoft_teams.api.activities.invoke": microsoft_teams_api_activities_invoke,
         "microsoft_teams.api.activities.invoke.adaptive_card": microsoft_teams_api_activities_invoke_adaptive_card,
+        "microsoft_teams.api.activities.invoke.file_consent": microsoft_teams_api_activities_invoke_file_consent,
         "microsoft_teams.common": microsoft_teams_common,
         "microsoft_teams.common.http": microsoft_teams_common_http,
         "microsoft_teams.common.http.client": microsoft_teams_common_http_client,
@@ -298,6 +308,16 @@ class TestTeamsPluginRegistration:
         register(ctx)
         kwargs = ctx.register_platform.call_args[1]
         assert kwargs["name"] == "teams"
+
+    def test_register_splits_passive_probe_from_active_installer(self):
+        # check_fn is the PASSIVE probe (status displays call it freely);
+        # the ACTIVE lazy-installer rides on ensure_deps_fn, which
+        # create_adapter() invokes when the passive probe fails (#79812).
+        ctx = MagicMock()
+        register(ctx)
+        kwargs = ctx.register_platform.call_args[1]
+        assert kwargs["check_fn"] is check_requirements
+        assert kwargs["ensure_deps_fn"] is check_teams_requirements
 
     def test_register_auth_env_vars(self):
         ctx = MagicMock()
