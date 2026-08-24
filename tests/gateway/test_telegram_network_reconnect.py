@@ -9,32 +9,11 @@ rather than silently leaving polling dead.
 import ast
 import asyncio
 from pathlib import Path
-import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-
-
-def _ensure_telegram_mock():
-    if "telegram" in sys.modules and hasattr(sys.modules["telegram"], "__file__"):
-        return
-
-    telegram_mod = MagicMock()
-    telegram_mod.ext.ContextTypes.DEFAULT_TYPE = type(None)
-    telegram_mod.constants.ParseMode.MARKDOWN_V2 = "MarkdownV2"
-    telegram_mod.constants.ChatType.GROUP = "group"
-    telegram_mod.constants.ChatType.SUPERGROUP = "supergroup"
-    telegram_mod.constants.ChatType.CHANNEL = "channel"
-    telegram_mod.constants.ChatType.PRIVATE = "private"
-
-    for name in ("telegram", "telegram.ext", "telegram.constants", "telegram.request"):
-        sys.modules.setdefault(name, telegram_mod)
-
-
-_ensure_telegram_mock()
-
 from plugins.platforms.telegram import adapter as tg_adapter  # noqa: E402
 from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
 from gateway.run import GatewayRunner  # noqa: E402
@@ -618,3 +597,71 @@ async def test_handle_polling_network_error_updater_stop_timeout():
     # The reconnect ladder must have advanced past the hung stop().
     assert drain_called, "_drain_polling_connections was not called after stop() timeout"
     assert start_polling_called, "start_polling was not called after stop() timeout"
+
+
+@pytest.mark.asyncio
+async def test_disconnect_releases_token_lock_before_wedged_app_shutdown(monkeypatch):
+    """#80598: token lock must drop even when app.shutdown() never returns.
+
+    The reconnect watcher creates a fresh adapter that re-acquires the bot-token
+    lock. If disconnect only releases the lock after a wedged PTB shutdown, the
+    watcher fails forever with a lock conflict while the process stays alive.
+    """
+    adapter = _make_adapter()
+    released = []
+    monkeypatch.setattr(
+        adapter, "_release_platform_lock", lambda: released.append(True)
+    )
+    monkeypatch.setattr(adapter, "_set_status_indicator", AsyncMock())
+    monkeypatch.setattr(adapter, "_cancel_pending_delivery_tasks", AsyncMock())
+
+    app = MagicMock()
+    app.updater = MagicMock()
+    app.updater.running = False
+    app.running = True
+    app.stop = AsyncMock()
+
+    async def _hanging_shutdown():
+        await asyncio.Event().wait()
+
+    app.shutdown = _hanging_shutdown
+    adapter._app = app
+    adapter._bot = MagicMock()
+
+    monkeypatch.setattr(tg_adapter, "_DISCONNECT_STEP_TIMEOUT", 0.01)
+
+    await asyncio.wait_for(adapter.disconnect(), timeout=1.0)
+
+    assert released, "token lock must be released before wedged shutdown"
+    assert adapter._app is None
+
+
+@pytest.mark.asyncio
+async def test_disconnect_advances_past_cancellation_swallowing_lifecycle(monkeypatch):
+    """#80598: lifecycle tasks that swallow CancelledError must not wedge disconnect."""
+    adapter = _make_adapter()
+    monkeypatch.setattr(adapter, "_release_platform_lock", MagicMock())
+    monkeypatch.setattr(adapter, "_set_status_indicator", AsyncMock())
+    monkeypatch.setattr(adapter, "_cancel_pending_delivery_tasks", AsyncMock())
+
+    release = asyncio.Event()
+
+    async def swallow_cancel():
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                continue
+
+    wedged = asyncio.create_task(swallow_cancel())
+    adapter._polling_error_task = wedged
+    adapter._app = None
+    adapter._bot = None
+
+    monkeypatch.setattr(tg_adapter, "_DISCONNECT_STEP_TIMEOUT", 0.01)
+
+    await asyncio.wait_for(adapter.disconnect(), timeout=1.0)
+    assert adapter._polling_error_task is None
+
+    release.set()
+    await asyncio.wait({wedged}, timeout=0.2)

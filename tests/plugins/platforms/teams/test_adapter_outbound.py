@@ -315,9 +315,9 @@ async def test_send_attachment_uses_conv_ref_when_available(adapter, doc_file):
 async def test_send_typing_uses_conv_ref_when_available(adapter):
     # Bind the real SDK symbols (TypingActivityInput) so send_typing can
     # construct the activity regardless of test ordering — connect() binds
-    # these lazily via check_requirements(); this test never calls connect().
+    # these lazily via check_teams_requirements(); this test never calls connect().
     from plugins.platforms.teams import adapter as _teams_mod
-    _teams_mod.check_requirements()
+    _teams_mod.check_teams_requirements()
 
     chat_id = "a:dm-with-ref"
     ref = Mock()
@@ -337,7 +337,7 @@ async def test_send_typing_uses_conv_ref_when_available(adapter):
 @pytest.mark.asyncio
 async def test_send_typing_falls_back_to_app_send_without_conv_ref(adapter):
     from plugins.platforms.teams import adapter as _teams_mod
-    _teams_mod.check_requirements()
+    _teams_mod.check_teams_requirements()
 
     chat_id = "a:dm-no-ref"  # no conv_ref stored
     await adapter.send_typing(chat_id)
@@ -987,7 +987,7 @@ async def test_connect_captures_running_loop(monkeypatch, adapter):
     confirm the running gateway loop lands in ``self._loop``."""
     import asyncio as _asyncio
 
-    # connect() now binds the SDK symbols lazily via check_requirements()
+    # connect() now binds the SDK symbols lazily via check_teams_requirements()
     # (the #62935 find_spec/.env-pollution fix) rather than at module import.
     # Bind the real symbols first so ones this test does NOT monkeypatch
     # (e.g. ClientOptions, used at App() construction) are non-None; the
@@ -995,7 +995,7 @@ async def test_connect_captures_running_loop(monkeypatch, adapter):
     # this the test only passed when another test happened to bind the
     # globals first (order-dependent).
     from plugins.platforms.teams import adapter as _teams_mod
-    _teams_mod.check_requirements()
+    _teams_mod.check_teams_requirements()
 
     # Stub out the SDK App + its initialize() coro. The fixture already
     # filled ``adapter._app`` with a mock; we replace the App() *class*
