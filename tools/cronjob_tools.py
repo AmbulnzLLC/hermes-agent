@@ -352,6 +352,16 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
             # send_message, which passes HERMES_SESSION_USER_ID to
             # gateway.mirror.mirror_to_session. Harmless for DMs/shared sessions.
             "user_id": get_session_env("HERMES_SESSION_USER_ID") or None,
+            # Workspace/server scope (Slack team, Discord guild, Matrix
+            # server). build_session_key embeds it in every Slack session key
+            # (dm/group/thread alike), so a continuable cron seed built
+            # WITHOUT it creates a row no scoped reply ever resolves to —
+            # the seeded key is agent:main:slack:dm:<chat>:<thread> while the
+            # reply keys agent:main:slack:dm:<team>:<chat>:<thread>. Captured
+            # here so the scheduler's seed helpers can reproduce the reply's
+            # exact key. Same session-context var async_delegation already
+            # snapshots; None for platforms without scope.
+            "scope_id": get_session_env("HERMES_SESSION_SCOPE_ID") or None,
         }
     return None
 
@@ -638,6 +648,7 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "last_run_at": job.get("last_run_at"),
         "last_status": job.get("last_status"),
         "last_delivery_error": job.get("last_delivery_error"),
+        "last_fire_error": job.get("last_fire_error"),
         "enabled": job.get("enabled", True),
         # Derive from enabled so half-paused records never render as paused.
         "state": effective_job_state(job),
@@ -646,6 +657,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     }
     if job.get("script"):
         result["script"] = job["script"]
+    if job.get("reasoning_effort"):
+        result["reasoning_effort"] = job["reasoning_effort"]
     if job.get("monitor_script"):
         result["monitor_script"] = job["monitor_script"]
     if job.get("monitor_url"):
@@ -658,6 +671,17 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["enabled_toolsets"] = job["enabled_toolsets"]
     if job.get("workdir"):
         result["workdir"] = job["workdir"]
+    stored_refs = job.get("context_from") or []
+    if isinstance(stored_refs, str):
+        stored_refs = [stored_refs]
+    if any(str(r).strip().lower() == "self" or r == job.get("id") for r in stored_refs):
+        result["continuity"] = True
+    external_refs = [
+        r for r in stored_refs
+        if str(r).strip().lower() != "self" and r != job.get("id")
+    ]
+    if external_refs:
+        result["context_from"] = external_refs
     return result
 
 
@@ -680,9 +704,11 @@ def _execute_job_now(
     Returns {"claimed": bool, "success": bool, "error": str|None}.
     """
     job_id = job["id"]
+    claimed_job = None
     try:
         # At-most-once claim: bail without running if a tick/other fire owns it.
-        if not claim_job_for_fire(job_id):
+        claimed_job = claim_job_for_fire(job_id, return_job=True)
+        if not isinstance(claimed_job, dict):
             # claim_job_for_fire returns False for paused/disabled/missing
             # jobs too — don't mislabel those as "already being fired"
             # (#60703): that message sends the user chasing a phantom
@@ -703,7 +729,7 @@ def _execute_job_now(
             pass
         return {"claimed": True, "success": False, "error": str(e)}
 
-    return _run_claimed_job(job, extra_prompt=extra_prompt)
+    return _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
 
 
 def _run_claimed_job(
@@ -720,6 +746,7 @@ def _run_claimed_job(
     """
     job_id = job["id"]
     _registered = False
+    fire_owner = None
     try:
         from cron.scheduler import (
             release_running_job,
@@ -745,8 +772,13 @@ def _run_claimed_job(
             }
         _registered = True
 
+        claim = job.get("fire_claim")
+        fire_owner = str(claim.get("by") or "") if isinstance(claim, dict) else None
+
         # run_one_job records last_run_at/last_status via mark_job_run (which
         # also clears the fire claim) and returns True iff it processed the job.
+        # ``job`` here is the exact claimed snapshot (owner-bearing), so the
+        # shared body fences every terminal write by that owner.
         #
         # A manual `run` executes the job synchronously on the caller's thread,
         # and a cron job is itself a full agent run that routinely takes
@@ -854,10 +886,19 @@ def _run_claimed_job(
             except Exception:
                 pass
         try:
-            mark_job_run(job_id, False, str(e))
+            mark_job_run(
+                job_id,
+                False,
+                str(e),
+                expected_fire_owner=fire_owner,
+            )
         except Exception:
             pass
-        return {"claimed": True, "success": False, "error": str(e)}
+        return {
+            "claimed": True,
+            "success": False,
+            "error": str(e),
+        }
 
 
 def _latest_job_output_excerpt(job_id: str, max_chars: int = 2000) -> Optional[str]:
@@ -936,6 +977,34 @@ def _try_dispatch_background_run(
     job_id = job["id"]
     job_name = str(job.get("name") or job_id)
 
+    # Reap any execution row this job (or any job) left stranded 'claimed'/
+    # 'running' by a dead owner process -- e.g. a PRIOR one-shot `hermes
+    # cron run` invocation whose dispatched runner died with the exiting
+    # process before writing a terminal status (issue #86721). The
+    # long-lived scheduler ticker already does this once at its own
+    # startup (cron/scheduler.py's self.recover_interrupted()); a one-shot
+    # CLI invocation has no equivalent "startup" moment of its own, so it
+    # never got this self-heal -- leaving a permanently-stale claim that
+    # blocked every subsequent manual run on the same job. Safe and cheap:
+    # only provably-dead owners (PID gone, or PID reused by a different
+    # process per its start time) are reaped; a genuinely live owner's row
+    # is left untouched.
+    try:
+        from cron.executions import recover_interrupted_executions
+
+        _reclaimed = recover_interrupted_executions()
+        if _reclaimed:
+            logger.warning(
+                "Reclaimed %d stale cron execution(s) from dead owner(s) "
+                "before dispatching job '%s'",
+                _reclaimed,
+                job_name,
+            )
+    except Exception as _reap_exc:
+        # Best-effort self-heal; a failure here must not block dispatch —
+        # but stay diagnosable (mirrors the scheduler tick's reap handling).
+        logger.debug("Stale execution reclaim failed: %s", _reap_exc)
+
     # ---- routing capture (on THIS thread; contextvars don't cross the pool) ----
     # Resolved BEFORE the claim: with no routable session there is no durable
     # consumer for a detached completion, so we must not claim-and-dispatch.
@@ -978,7 +1047,10 @@ def _try_dispatch_background_run(
         except Exception:
             pass
 
-        if not claim_job_for_fire(job_id):
+        # Same snapshot claim as _execute_job_now: carry the owner-bearing
+        # record into the run so terminal writes stay fenced by this owner.
+        claimed_job = claim_job_for_fire(job_id, return_job=True)
+        if not isinstance(claimed_job, dict):
             refreshed = get_job(job_id)
             if refreshed is None:
                 reason = "Job no longer exists; nothing to run."
@@ -1015,7 +1087,7 @@ def _try_dispatch_background_run(
             "cronjob run: async delegation registry unavailable (%s); "
             "running job '%s' inline.", e, job_name,
         )
-        result = _run_claimed_job(job, extra_prompt=extra_prompt)
+        result = _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
         result["dispatched"] = False
         return result
 
@@ -1030,7 +1102,7 @@ def _try_dispatch_background_run(
     deliver = job.get("deliver", "local")
 
     def _runner() -> Dict[str, Any]:
-        res = _run_claimed_job(job, extra_prompt=extra_prompt)
+        res = _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
         duration = round(time.time() - started_at, 2)
         refreshed = get_job(job_id) or {}
         lines = [
@@ -1093,6 +1165,30 @@ def _try_dispatch_background_run(
     return result
 
 
+def _apply_continuity(
+    context_from: Optional[Union[str, List[str]]],
+    continuity: bool,
+) -> Optional[List[str]]:
+    """Translate the ``continuity`` flag into the ``context_from`` list.
+
+    ``continuity=True`` ensures ``"self"`` is present (the job's own previous
+    output is injected each run); ``continuity=False`` removes any
+    ``"self"``/own-id entry. Other entries are preserved untouched.
+    """
+    if isinstance(context_from, str):
+        refs = [context_from.strip()] if context_from.strip() else []
+    elif context_from:
+        refs = [str(j).strip() for j in context_from if str(j).strip()]
+    else:
+        refs = []
+    has_self = any(r.lower() == "self" for r in refs)
+    if continuity and not has_self:
+        refs.append("self")
+    elif not continuity and has_self:
+        refs = [r for r in refs if r.lower() != "self"]
+    return refs or None
+
+
 def cronjob(
     action: str,
     job_id: Optional[str] = None,
@@ -1110,12 +1206,14 @@ def cronjob(
     reason: Optional[str] = None,
     script: Optional[str] = None,
     context_from: Optional[Union[str, List[str]]] = None,
+    continuity: Optional[bool] = None,
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
     attach_to_session: Optional[bool] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
 ) -> str:
@@ -1172,12 +1270,22 @@ def cronjob(
                 from cron.jobs import get_job as _get_job
                 refs = [context_from] if isinstance(context_from, str) else context_from
                 for ref_id in refs:
+                    # "self" is resolved to the job's own id at run time —
+                    # it can't be validated against the store (the job does
+                    # not exist yet at create time).
+                    if isinstance(ref_id, str) and ref_id.strip().lower() == "self":
+                        continue
                     if not _get_job(ref_id):
                         return tool_error(
                             f"context_from job '{ref_id}' not found. "
                             "Use cronjob(action='list') to see available jobs.",
                             success=False,
                         )
+
+            # continuity=True is sugar for context_from including "self":
+            # the job wakes up with its own previous run's output injected.
+            if continuity is not None:
+                context_from = _apply_continuity(context_from, continuity)
 
             from cron.scheduler import (
                 CronSchedulerRegistrationError,
@@ -1206,6 +1314,12 @@ def cronjob(
                     attach_to_session=attach_to_session,
                     monitor_script=_normalize_optional_job_value(monitor_script),
                     monitor_url=_normalize_optional_job_value(monitor_url),
+                    # reasoning_effort reaches here from the CLI
+                    # (hermes cron create --reasoning-effort) ONLY — it is
+                    # deliberately absent from CRONJOB_SCHEMA and the model
+                    # dispatch below: models do not make model-config
+                    # decisions (standing policy).
+                    reasoning_effort=reasoning_effort,
                 )
             except CronSchedulerRegistrationError as exc:
                 _partial = exc.to_dict()
@@ -1388,6 +1502,10 @@ def cronjob(
                 updates["provider"] = _normalize_optional_job_value(provider)
             if base_url is not None:
                 updates["base_url"] = _normalize_optional_job_value(base_url, strip_trailing_slash=True)
+            if reasoning_effort is not None:
+                # CLI-only lane (see create above): update_job validates
+                # against the canonical grammar; empty string clears the pin.
+                updates["reasoning_effort"] = reasoning_effort
             # Re-validate the EFFECTIVE provider/base_url on EVERY update, not
             # only when this update supplies provider/base_url. A job persisted
             # before this guard (or written directly to the jobs store) may
@@ -1441,17 +1559,26 @@ def cronjob(
                         "clear one before setting the other.",
                         success=False,
                     )
-            if context_from is not None:
+            if context_from is not None or continuity is not None:
                 # Empty string / empty list clears the field; otherwise validate
                 # each referenced job exists before storing. Normalized to a list
                 # (or None) to match the shape stored by create_job().
-                if isinstance(context_from, str):
+                if context_from is None:
+                    # continuity-only update: start from the job's stored refs.
+                    existing = job.get("context_from") or []
+                    refs = [str(j).strip() for j in existing if str(j).strip()]
+                elif isinstance(context_from, str):
                     refs = [context_from.strip()] if context_from.strip() else []
                 else:
                     refs = [str(j).strip() for j in context_from if str(j).strip()]
+                if continuity is not None:
+                    refs = _apply_continuity(refs, continuity) or []
                 if refs:
                     from cron.jobs import get_job as _get_job
                     for ref_id in refs:
+                        # "self" resolves to the job's own id at run time.
+                        if ref_id.lower() == "self":
+                            continue
                         if not _get_job(ref_id):
                             return tool_error(
                                 f"context_from job '{ref_id}' not found. "
@@ -1601,10 +1728,23 @@ Scheduling from cron-run sessions is disabled by default and enabled via cron.al
                     "Optional job ID or list of job IDs whose most recent completed output is "
                     "injected into the prompt as context before each run. "
                     "Use this to chain cron jobs: job A collects data, job B processes it. "
-                    "Each entry must be a valid job ID (from cronjob action='list'). "
+                    "Each entry must be a valid job ID (from cronjob action='list'); "
+                    "for a job's OWN previous output, prefer the `continuity` flag. "
                     "Note: injects the most recent completed output — does not wait for "
                     "upstream jobs running in the same tick. "
                     "On update, pass an empty array to clear."
+                ),
+            },
+            "continuity": {
+                "type": "boolean",
+                "description": (
+                    "When true, this recurring job carries continuity across runs: each run "
+                    "wakes up with the job's own most recent output injected into its prompt, "
+                    "so it can dedupe against what was already reported and continue where the "
+                    "last run left off (scouts, monitors, incremental digests). "
+                    "First run has no previous output and runs unchanged. "
+                    "On update, pass false to turn continuity off (other context_from entries "
+                    "are preserved). Default: false."
                 ),
             },
             "enabled_toolsets": {
@@ -1674,6 +1814,7 @@ registry.register(
         reason=args.get("reason"),
         script=args.get("script"),
         context_from=args.get("context_from"),
+        continuity=args.get("continuity"),
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
