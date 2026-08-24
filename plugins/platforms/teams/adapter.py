@@ -1107,6 +1107,42 @@ class TeamsAdapter(BasePlatformAdapter):
         self._mark_disconnected()
         logger.info("[teams] Disconnected")
 
+    async def _fetch_attachment_bytes(self, url: str, timeout: float = 60.0) -> bytes:
+        """Download a pre-authenticated attachment URL with SSRF protection.
+
+        Used for the ``file.download.info`` shape, whose SharePoint
+        ``downloadUrl`` carries its own tempauth token and therefore rejects
+        an ``Authorization`` header (that's why this is separate from
+        ``_fetch_bf_attachment_bytes``, which mints a bot token for Bot
+        Framework ``/v3/attachments/`` endpoints).
+
+        The URL is attacker-influenced — it arrives inside an inbound Teams
+        activity — so it MUST go through the SSRF guard before we fetch it.
+        Mirrors upstream's helper of the same name (and the
+        ``cache_*_from_url`` helpers in ``gateway.platforms.base``) so the
+        shared redirect guard applies on every hop.
+
+        Raises on non-2xx / blocked URL; the caller decides whether to fall
+        back to the Graph hosted-content path.
+        """
+        from tools.url_safety import create_ssrf_safe_async_client, is_safe_url
+        from gateway.platforms.base import _ssrf_redirect_guard
+
+        if not is_safe_url(url):
+            raise ValueError("Blocked unsafe attachment URL (SSRF protection)")
+
+        async with create_ssrf_safe_async_client(
+            timeout=timeout,
+            follow_redirects=True,
+            event_hooks={"response": [_ssrf_redirect_guard]},
+        ) as client:
+            response = await client.get(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)"},
+            )
+            response.raise_for_status()
+            return response.content
+
     async def _fetch_bf_attachment_bytes(self, url: str) -> Optional[bytes]:
         """GET a Bot Framework attachment URL with an SDK-minted bearer token.
 
@@ -1405,34 +1441,36 @@ class TeamsAdapter(BasePlatformAdapter):
                         )
                         continue
 
-                    # SharePoint tempauth URLs reject the Authorization header — fetch raw.
-                    import aiohttp as _aiohttp
-                    timeout = _aiohttp.ClientTimeout(total=60)
-                    async with _aiohttp.ClientSession(timeout=timeout) as sess:
-                        async with sess.get(download_url) as resp:
-                            logger.info(
-                                "[teams][attach][%d] tempauth GET %s -> status=%s",
-                                idx, filename, resp.status,
+                    # SharePoint tempauth URLs reject the Authorization header
+                    # — fetch raw, but through the SSRF-guarded helper (the
+                    # download_url arrives from an inbound activity, so it is
+                    # attacker-influenced). Any failure (blocked URL, non-2xx,
+                    # network error) falls back to Graph hosted content.
+                    data = None
+                    try:
+                        data = await self._fetch_attachment_bytes(download_url)
+                        logger.info(
+                            "[teams][attach][%d] tempauth GET %s -> %d bytes",
+                            idx, filename, len(data),
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "[teams][attach][%d] tempauth GET %s failed (%s) — "
+                            "trying Graph fallback",
+                            idx, filename, exc,
+                        )
+                        data = await self._try_graph_hosted_bytes(
+                            url=download_url,
+                            team_id=graph_team_id,
+                            channel_id=graph_channel_id,
+                            activity_id=graph_activity_id,
+                        )
+                        if data is None:
+                            logger.warning(
+                                "[teams][attach][%d] Graph fallback also failed for %s",
+                                idx, filename,
                             )
-                            if resp.status != 200:
-                                logger.warning(
-                                    "[teams][attach][%d] tempauth GET %s returned %s — trying Graph fallback",
-                                    idx, filename, resp.status,
-                                )
-                                data = await self._try_graph_hosted_bytes(
-                                    url=download_url,
-                                    team_id=graph_team_id,
-                                    channel_id=graph_channel_id,
-                                    activity_id=graph_activity_id,
-                                )
-                                if data is None:
-                                    logger.warning(
-                                        "[teams][attach][%d] Graph fallback also failed for %s",
-                                        idx, filename,
-                                    )
-                                    continue
-                            else:
-                                data = await resp.read()
+                            continue
                     logger.info("[teams][attach][%d] tempauth body len=%d bytes", idx, len(data))
 
                     if file_type in _IMAGE_EXTS:

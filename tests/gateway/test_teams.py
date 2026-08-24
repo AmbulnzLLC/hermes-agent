@@ -559,6 +559,59 @@ class TestTeamsAttachmentClassification:
         att.name = "img.png"
         return att
 
+    @pytest.mark.anyio
+    async def test_file_download_url_goes_through_ssrf_guard(self):
+        """The file.download.info downloadUrl MUST be SSRF-checked.
+
+        Regression guard: this path used to do a bare
+        ``aiohttp.ClientSession().get(download_url)`` with no URL validation.
+        The url arrives inside an inbound Teams activity, so a malicious /
+        compromised sender could point it at cloud metadata (169.254.169.254)
+        or an internal service and have the gateway fetch it. Upstream's
+        equivalent helper validates via ``is_safe_url``; the fork's inline GET
+        did not. Now both route through ``_fetch_attachment_bytes``.
+        """
+        adapter = self._make_adapter()
+        # No Graph fallback configured, so a blocked URL must yield no media.
+        adapter._try_graph_hosted_bytes = AsyncMock(return_value=None)
+
+        att = self._file_download_attachment()
+        att.content = {
+            "downloadUrl": "http://169.254.169.254/latest/meta-data/iam/",
+            "fileType": "pdf",
+        }
+        activity = self._make_activity([att])
+        await adapter._on_message(self._make_ctx(activity))
+
+        event = adapter.handle_message.call_args[0][0]
+        assert event.media_urls == [], (
+            "A metadata-endpoint downloadUrl must be blocked by the SSRF guard "
+            f"and cache nothing. Got {event.media_urls}."
+        )
+
+    @pytest.mark.anyio
+    async def test_file_download_falls_back_to_graph_on_fetch_failure(self):
+        """A failed tempauth GET must still try the Graph hosted-content path.
+
+        The SSRF refactor changed the control flow from an ``if status != 200``
+        branch to try/except, so pin that the fallback still fires.
+        """
+        adapter = self._make_adapter()
+        adapter._fetch_attachment_bytes = AsyncMock(
+            side_effect=RuntimeError("403 tempauth expired")
+        )
+        adapter._try_graph_hosted_bytes = AsyncMock(return_value=b"%PDF-1.4 viagraph")
+
+        activity = self._make_activity([self._file_download_attachment()])
+        await adapter._on_message(self._make_ctx(activity))
+
+        adapter._try_graph_hosted_bytes.assert_awaited_once()
+        event = adapter.handle_message.call_args[0][0]
+        assert len(event.media_urls) == 1, (
+            f"Graph fallback bytes should still be cached. Got {event.media_urls}."
+        )
+        assert event.media_types == ["application/pdf"]
+
     def _html_body_attachment(self):
         # Teams mirrors the message body as a text/html attachment
         att = MagicMock()
@@ -586,7 +639,24 @@ class TestTeamsAttachmentClassification:
         assert event.media_types == ["application/pdf"]
 
     @pytest.mark.anyio
-    async def test_mixed_image_and_document_prefers_document(self):
+    async def test_mixed_image_and_document_both_cached(self):
+        """A document mixed with an image must still be cached and delivered.
+
+        FORK DIVERGENCE (deliberate): upstream asserts the whole-message type
+        becomes DOCUMENT here. This fork classifies a mixed message as PHOTO
+        instead — see the "Image always wins" block in ``_on_message`` — because
+        the vision pipeline is the most useful interpretation when a user sends
+        both. Nothing is lost by that choice: ``gateway/run.py`` does
+        per-attachment document handling (it skips only attachments already
+        routed as image/audio/video and gives every other file a
+        path-pointing context note), so the PDF still reaches the agent as a
+        readable cached file even though the message-level type isn't DOCUMENT.
+
+        The real contract worth pinning is therefore *both attachments survive
+        with correct MIME types*, not the message-level enum. Asserting the
+        enum here would be a change-detector test against an intentional
+        fork behavior.
+        """
         from gateway.platforms.base import MessageType
 
         adapter = self._make_adapter()
@@ -604,8 +674,20 @@ class TestTeamsAttachmentClassification:
             await adapter._on_message(self._make_ctx(activity))
 
         event = adapter.handle_message.call_args[0][0]
-        assert event.message_type == MessageType.DOCUMENT
-        assert len(event.media_urls) == 2
+        assert event.message_type == MessageType.PHOTO, (
+            "This fork classifies mixed image+document as PHOTO (image wins); "
+            f"got {event.message_type}."
+        )
+        assert len(event.media_urls) == 2, (
+            "Both attachments must be cached — the document must not be dropped "
+            f"just because the message classified as PHOTO. Got {event.media_urls}."
+        )
+        assert any(
+            t == "application/pdf" for t in event.media_types
+        ), f"Document MIME must survive so run.py injects file context. Got {event.media_types}."
+        assert any(
+            t.startswith("image/") for t in event.media_types
+        ), f"Image MIME must survive. Got {event.media_types}."
 
 
 # ── _standalone_send (out-of-process cron delivery) ──────────────────────
@@ -728,7 +810,27 @@ class TestTeamsMediaAttachments:
     """send_video / send_voice / send_document route through the same
     Attachment mechanism as send_image so the gateway's media dispatch
     (run.py) delivers native attachments instead of the base-class text
-    fallback (file path sent as plain text)."""
+    fallback (file path sent as plain text).
+
+    FORK NOTE — chat_id shape matters here. This fork splits outbound file
+    delivery by conversation type in ``_send_local_file``:
+
+      * DM  (``19:<user>@unq.gbl.spaces`` / ``a:...``) → ``_send_dm_file_consent``
+        → FileConsentCard → ``_app.send``
+      * channel (``19:<group>@thread.tacv2``) → ``_send_channel_file``
+        → SharePoint upload via Graph
+
+    Upstream has no such split, so upstream's version of these tests used a
+    channel-shaped id (``19:abc@thread.v2``) harmlessly. In this fork that id
+    routes to the SharePoint path and fails closed with
+    "TEAMS_SHAREPOINT_SITE_ID not configured" — the tests were asserting the
+    DM/FileConsent contract while feeding a channel id. Use a DM-shaped id so
+    these exercise the base64/FileConsent path they were written for; channel
+    delivery has its own coverage.
+    """
+
+    # DM-shaped: _is_channel_chat() must return False for this id.
+    DM_CHAT_ID = "19:user123@unq.gbl.spaces"
 
     def _make_adapter(self):
         adapter = TeamsAdapter(_make_config(
@@ -739,14 +841,23 @@ class TestTeamsMediaAttachments:
         adapter._app.send = AsyncMock(return_value=MagicMock(id="msg-001"))
         return adapter
 
+    def test_dm_chat_id_is_not_classified_as_channel(self):
+        """Guard the fixture: if this id ever reads as a channel, the two
+        tests below would silently exercise the SharePoint path instead of
+        the FileConsent path they assert."""
+        adapter = self._make_adapter()
+        assert adapter._is_channel_chat(self.DM_CHAT_ID) is False
+        # And confirm the channel shape still classifies as one, so the
+        # split itself hasn't regressed into "everything is a DM".
+        assert adapter._is_channel_chat("19:group@thread.tacv2") is True
 
     @pytest.mark.asyncio
     async def test_send_voice_local_file_base64(self, tmp_path):
         adapter = self._make_adapter()
         audio = tmp_path / "reply.mp3"
         audio.write_bytes(b"ID3fakeaudio")
-        result = await adapter.send_voice("19:abc@thread.v2", str(audio), caption="here you go")
-        assert result.success
+        result = await adapter.send_voice(self.DM_CHAT_ID, str(audio), caption="here you go")
+        assert result.success, f"send_voice failed: {result.error}"
         adapter._app.send.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -754,8 +865,22 @@ class TestTeamsMediaAttachments:
         adapter = self._make_adapter()
         doc = tmp_path / "report.pdf"
         doc.write_bytes(b"%PDF-1.4 fake")
-        result = await adapter.send_document("19:abc@thread.v2", str(doc))
-        assert result.success
+        result = await adapter.send_document(self.DM_CHAT_ID, str(doc))
+        assert result.success, f"send_document failed: {result.error}"
         adapter._app.send.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_send_document_to_channel_without_sharepoint_fails_closed(self, tmp_path):
+        """The channel path must fail closed (not silently fall back to a DM
+        card) when SharePoint isn't configured — this is the behavior that
+        made the two tests above look broken, so pin it deliberately."""
+        adapter = self._make_adapter()
+        doc = tmp_path / "report.pdf"
+        doc.write_bytes(b"%PDF-1.4 fake")
+        result = await adapter.send_document("19:group@thread.tacv2", str(doc))
+        assert result.success is False
+        assert "TEAMS_SHAREPOINT_SITE_ID" in (result.error or "")
+        assert result.retryable is False
+        adapter._app.send.assert_not_awaited()
 
 
