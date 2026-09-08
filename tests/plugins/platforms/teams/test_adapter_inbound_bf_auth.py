@@ -90,7 +90,7 @@ _BF_URL = (
 
 
 # ---------------------------------------------------------------------------
-# _fetch_bf_attachment_bytes
+# _fetch_attachment_bytes_or_none
 # ---------------------------------------------------------------------------
 
 
@@ -143,38 +143,65 @@ class _FakeSession:
 
 
 @pytest.mark.asyncio
-async def test_fetch_bf_attachment_bytes_attaches_bearer_header(adapter, monkeypatch):
-    fake_resp = _FakeResp(200, body=b"PNGDATA")
-    fake_session = _FakeSession(fake_resp)
+async def test_fetch_attachment_bytes_or_none_delegates_to_guarded_fetch(adapter, monkeypatch):
+    """BF auth now rides upstream's ``_fetch_attachment_bytes``, which attaches the bearer for
+    BF hosts via ``_get_botframework_token`` behind the SSRF guard + media size cap."""
+    calls = {}
 
-    import aiohttp
+    async def fake_token():
+        calls["token"] = True
+        return "FAKE.JWT.TOKEN"
 
-    monkeypatch.setattr(
-        aiohttp, "ClientSession", lambda *a, **kw: fake_session
-    )
+    captured = {}
 
-    data = await adapter._fetch_bf_attachment_bytes(_BF_URL)
+    async def fake_fetch(url, timeout=60.0):
+        captured["url"] = url
+        # Prove the bearer is sourced from the BF token helper on this path.
+        captured["token"] = await adapter._get_botframework_token()
+        return b"PNGDATA"
+
+    monkeypatch.setattr(adapter, "_get_botframework_token", fake_token)
+    monkeypatch.setattr(adapter, "_fetch_attachment_bytes", fake_fetch)
+
+    data = await adapter._fetch_attachment_bytes_or_none(_BF_URL)
     assert data == b"PNGDATA"
-    assert fake_session.captured_url == _BF_URL
-    assert fake_session.captured_headers is not None
-    assert fake_session.captured_headers.get("Authorization") == "Bearer FAKE.JWT.TOKEN"
-    adapter._app._get_bot_token.assert_awaited_once()
+    assert captured["url"] == _BF_URL
+    assert captured["token"] == "FAKE.JWT.TOKEN"
+    assert calls.get("token") is True
 
 
 @pytest.mark.asyncio
-async def test_fetch_bf_attachment_bytes_returns_none_on_401(adapter, monkeypatch):
-    fake_resp = _FakeResp(401)
-    fake_session = _FakeSession(fake_resp)
-    import aiohttp
+async def test_fetch_attachment_bytes_or_none_returns_body_via_authenticated_path(adapter, monkeypatch):
+    """Contract: the wrapper returns the body from the SSRF-guarded, size-capped fetch.
 
-    monkeypatch.setattr(aiohttp, "ClientSession", lambda *a, **kw: fake_session)
+    The fork's raw-aiohttp + SDK ``_get_bot_token`` helper was collapsed into upstream's
+    ``_fetch_attachment_bytes`` (which adds the BF bearer via ``_get_botframework_token``), so
+    pin the delegation and the returned bytes rather than the transport internals.
+    """
+    seen = {}
 
-    data = await adapter._fetch_bf_attachment_bytes(_BF_URL)
-    assert data is None
+    async def fake_fetch(url, timeout=60.0):
+        seen["url"] = url
+        return b"PNGDATA"
+
+    monkeypatch.setattr(adapter, "_fetch_attachment_bytes", fake_fetch)
+    assert await adapter._fetch_attachment_bytes_or_none(_BF_URL) == b"PNGDATA"
+    assert seen["url"] == _BF_URL
 
 
 @pytest.mark.asyncio
-async def test_fetch_bf_attachment_bytes_returns_none_when_no_app(monkeypatch):
+async def test_fetch_attachment_bytes_or_none_swallows_fetch_failure(adapter, monkeypatch):
+    """A 401/network failure must return None (not raise) so the caller can fall back to Graph."""
+
+    async def boom(url, timeout=60.0):
+        raise RuntimeError("401 Unauthorized")
+
+    monkeypatch.setattr(adapter, "_fetch_attachment_bytes", boom)
+    assert await adapter._fetch_attachment_bytes_or_none(_BF_URL) is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_attachment_bytes_or_none_rejects_empty_url(monkeypatch):
     cfg = PlatformConfig(
         enabled=True,
         extra={
@@ -184,10 +211,7 @@ async def test_fetch_bf_attachment_bytes_returns_none_when_no_app(monkeypatch):
         },
     )
     a = TeamsAdapter(cfg)
-    # _app is None here — nothing to mint a token from.
-    assert a._app is None
-    out = await a._fetch_bf_attachment_bytes(_BF_URL)
-    assert out is None
+    assert await a._fetch_attachment_bytes_or_none("") is None
 
 
 # ---------------------------------------------------------------------------
@@ -229,9 +253,9 @@ def _make_attachment(content_type, content_url, name=None):
 
 @pytest.mark.asyncio
 async def test_image_branch_uses_bf_fetch_when_url_is_bf(adapter, monkeypatch):
-    """BF image URL should go through _fetch_bf_attachment_bytes + cache_image_from_bytes."""
+    """BF image URL should go through _fetch_attachment_bytes_or_none + cache_image_from_bytes."""
     fetch_spy = AsyncMock(return_value=b"PNGBYTES")
-    adapter._fetch_bf_attachment_bytes = fetch_spy  # type: ignore[method-assign]
+    adapter._fetch_attachment_bytes_or_none = fetch_spy  # type: ignore[method-assign]
 
     captured = {}
 
@@ -264,7 +288,7 @@ async def test_image_branch_uses_bf_fetch_when_url_is_bf(adapter, monkeypatch):
 async def test_image_branch_uses_url_helper_when_url_is_not_bf(adapter, monkeypatch):
     """Non-BF image URL should keep using cache_image_from_url unchanged."""
     fetch_spy = AsyncMock(side_effect=AssertionError("should not BF-fetch for non-BF urls"))
-    adapter._fetch_bf_attachment_bytes = fetch_spy  # type: ignore[method-assign]
+    adapter._fetch_attachment_bytes_or_none = fetch_spy  # type: ignore[method-assign]
 
     url_helper = AsyncMock(return_value="/cache/img.jpg")
     import plugins.platforms.teams.adapter as adapter_mod
@@ -285,7 +309,7 @@ async def test_image_branch_uses_url_helper_when_url_is_not_bf(adapter, monkeypa
 @pytest.mark.asyncio
 async def test_audio_branch_uses_bf_fetch_when_url_is_bf(adapter, monkeypatch):
     fetch_spy = AsyncMock(return_value=b"OGGDATA")
-    adapter._fetch_bf_attachment_bytes = fetch_spy  # type: ignore[method-assign]
+    adapter._fetch_attachment_bytes_or_none = fetch_spy  # type: ignore[method-assign]
 
     captured = {}
 
@@ -315,7 +339,7 @@ async def test_audio_branch_uses_bf_fetch_when_url_is_bf(adapter, monkeypatch):
 @pytest.mark.asyncio
 async def test_video_branch_uses_bf_fetch_when_url_is_bf(adapter, monkeypatch):
     fetch_spy = AsyncMock(return_value=b"MP4DATA")
-    adapter._fetch_bf_attachment_bytes = fetch_spy  # type: ignore[method-assign]
+    adapter._fetch_attachment_bytes_or_none = fetch_spy  # type: ignore[method-assign]
 
     captured = {}
 
