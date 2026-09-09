@@ -167,7 +167,7 @@ def _make_attachment(content_type, content_url, name=None):
 async def test_image_wildcard_mime_with_png_bytes_sniffs_to_png(adapter, monkeypatch):
     """Regression: content_type='image/*' + PNG bytes used to cache as 'img_xxx.*'."""
     fetch_spy = AsyncMock(return_value=_PNG)
-    adapter._fetch_bf_attachment_bytes = fetch_spy  # type: ignore[method-assign]
+    adapter._fetch_attachment_bytes_or_none = fetch_spy  # type: ignore[method-assign]
 
     captured = {}
 
@@ -192,7 +192,7 @@ async def test_image_wildcard_mime_with_png_bytes_sniffs_to_png(adapter, monkeyp
 @pytest.mark.asyncio
 async def test_image_wildcard_mime_with_jpeg_bytes_sniffs_to_jpg(adapter, monkeypatch):
     fetch_spy = AsyncMock(return_value=_JPG)
-    adapter._fetch_bf_attachment_bytes = fetch_spy  # type: ignore[method-assign]
+    adapter._fetch_attachment_bytes_or_none = fetch_spy  # type: ignore[method-assign]
 
     captured = {}
 
@@ -215,7 +215,7 @@ async def test_image_wildcard_mime_with_jpeg_bytes_sniffs_to_jpg(adapter, monkey
 @pytest.mark.asyncio
 async def test_audio_wildcard_mime_with_ogg_bytes_sniffs_to_ogg(adapter, monkeypatch):
     fetch_spy = AsyncMock(return_value=_OGG)
-    adapter._fetch_bf_attachment_bytes = fetch_spy  # type: ignore[method-assign]
+    adapter._fetch_attachment_bytes_or_none = fetch_spy  # type: ignore[method-assign]
 
     captured = {}
 
@@ -239,7 +239,7 @@ async def test_audio_wildcard_mime_with_ogg_bytes_sniffs_to_ogg(adapter, monkeyp
 @pytest.mark.asyncio
 async def test_video_wildcard_mime_with_mp4_bytes_sniffs_to_mp4(adapter, monkeypatch):
     fetch_spy = AsyncMock(return_value=_MP4)
-    adapter._fetch_bf_attachment_bytes = fetch_spy  # type: ignore[method-assign]
+    adapter._fetch_attachment_bytes_or_none = fetch_spy  # type: ignore[method-assign]
 
     captured = {}
 
@@ -264,7 +264,7 @@ async def test_video_wildcard_mime_with_mp4_bytes_sniffs_to_mp4(adapter, monkeyp
 async def test_image_wildcard_mime_unsniffable_falls_back_to_jpg(adapter, monkeypatch):
     """When sniffer can't ID the bytes, default to ``.jpg`` — never ``.*``."""
     fetch_spy = AsyncMock(return_value=b"\x00\x00\x00\x00garbage")
-    adapter._fetch_bf_attachment_bytes = fetch_spy  # type: ignore[method-assign]
+    adapter._fetch_attachment_bytes_or_none = fetch_spy  # type: ignore[method-assign]
 
     captured = {}
 
