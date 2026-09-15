@@ -1016,20 +1016,17 @@ async def test_connect_captures_running_loop(monkeypatch, adapter):
         "plugins.platforms.teams.adapter.AIOHTTP_AVAILABLE", True
     )
 
-    # Stub out the aiohttp listener so we don't bind a port.
+    # Stub out the aiohttp listener so we don't bind a port. connect() now delegates to
+    # gateway.platforms.shared_ingress.bind_listener, which imports `web` from aiohttp
+    # itself and passes reuse_address=, so patch it there rather than on the adapter.
     fake_runner = MagicMock()
     fake_runner.setup = AsyncMock()
     fake_runner.cleanup = AsyncMock()
-    monkeypatch.setattr(
-        "plugins.platforms.teams.adapter.web.AppRunner", lambda app: fake_runner
-    )
+    monkeypatch.setattr("aiohttp.web.AppRunner", lambda app, **kw: fake_runner)
 
     fake_site = MagicMock()
     fake_site.start = AsyncMock()
-    monkeypatch.setattr(
-        "plugins.platforms.teams.adapter.web.TCPSite",
-        lambda runner, host, port: fake_site,
-    )
+    monkeypatch.setattr("aiohttp.web.TCPSite", lambda runner, host, port, **kw: fake_site)
 
     ok = await adapter.connect()
     try:
