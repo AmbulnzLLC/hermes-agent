@@ -1028,7 +1028,7 @@ async def test_connect_captures_running_loop(monkeypatch, adapter):
     fake_site.start = AsyncMock()
     monkeypatch.setattr(
         "plugins.platforms.teams.adapter.web.TCPSite",
-        lambda runner, host, port: fake_site,
+        lambda runner, host, port, **_kw: fake_site,
     )
 
     ok = await adapter.connect()
