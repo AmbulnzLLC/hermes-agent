@@ -393,6 +393,9 @@ def bedrock_guardrail_config(config: Optional[Dict[str, Any]] = None) -> Optiona
     for src, dst in (("stream_processing_mode", "streamProcessingMode"), ("trace", "trace")):
         if gr.get(src):
             out[dst] = gr[src]
+    if out.get("trace"):
+        # Converse's guardrailConfig.trace enum is lower-case (enabled|enabled_full|disabled).
+        out["trace"] = str(out["trace"]).strip().lower()
     return out
 
 

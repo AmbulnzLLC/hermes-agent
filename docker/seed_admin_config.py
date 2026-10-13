@@ -25,8 +25,9 @@ directly, so there is a single source of truth for admin config.
 
 Compliance guarantee preserved across the migration:
 - ``bedrock.guardrail.trace``, when present in the merged config, must be one of
-  ``ENABLED``, ``ENABLED_FULL``, ``DISABLED`` (case-insensitive; normalized to
-  upper-case on write).  Anything else is rejected with a non-zero exit so a
+  ``enabled``, ``enabled_full``, ``disabled`` (case-insensitive; normalized to
+  lower-case on write -- the Converse API's ``guardrailConfig.trace`` enum is
+  lower-case; the InvokeModel header paths upper-case it themselves).  Anything else is rejected with a non-zero exit so a
   misconfigured guardrail crash-loops rather than silently disabling tracing.
   This validation is now source-agnostic: it fires whether the trace value came
   from the overlay or was already on disk.
@@ -57,7 +58,7 @@ import yaml
 
 _DEFAULT_OVERLAY_PATH = "/config/overlay.yaml"
 
-_VALID_GUARDRAIL_TRACE = {"ENABLED", "ENABLED_FULL", "DISABLED"}
+_VALID_GUARDRAIL_TRACE = {"enabled", "enabled_full", "disabled"}
 
 
 def _deep_merge(base: dict, overlay: dict) -> None:
@@ -129,7 +130,7 @@ def _validate_guardrail_trace(cfg: dict) -> int:
     effective value regardless of source (overlay or pre-existing on disk).
 
     - No bedrock/guardrail block, or no ``trace`` key → no-op (returns 0).
-    - A valid value (case-insensitive) is normalized to upper-case in place.
+    - A valid value (case-insensitive) is normalized to lower-case in place.
     - Anything else → ERROR + return 1 so the pod crash-loops.
     """
     bedrock = cfg.get("bedrock")
@@ -148,7 +149,7 @@ def _validate_guardrail_trace(cfg: dict) -> int:
         del guardrail["trace"]
         return 0
 
-    normalized = str(raw).strip().upper()
+    normalized = str(raw).strip().lower()
     if normalized not in _VALID_GUARDRAIL_TRACE:
         print(
             f"[seed_admin_config] ERROR: bedrock.guardrail.trace={raw!r} is not "
