@@ -9,7 +9,7 @@ contract:
   lists, and ``None`` replace the value at that path.
 - Idempotent — only writes when the merged result differs from disk.
 - Compliance guarantee: ``bedrock.guardrail.trace`` in the merged config is
-  validated (source-agnostic) and normalized to upper-case; an invalid value
+  validated (source-agnostic) and normalized to lower-case; an invalid value
   crashes the boot so guardrail observability can't be silently disabled.
 - Fail-open: a missing/empty/non-mapping/unparseable overlay, or a pre-broken
   config.yaml, is skipped/left untouched rather than clobbered.
@@ -221,18 +221,18 @@ def test_idempotent_when_matching(hermes_home, monkeypatch):
 
 
 def test_guardrail_idempotent_normalized_trace(hermes_home, monkeypatch):
-    """Config already has upper-case trace matching the overlay → no rewrite."""
+    """Config already has normalized (lower-case) trace matching the overlay → no rewrite."""
     cfg_path = hermes_home / "config.yaml"
     cfg_path.write_text(
         yaml.safe_dump(
-            {"bedrock": {"guardrail": {"guardrail_identifier": "gr-abc", "guardrail_version": "DRAFT", "trace": "ENABLED"}}}
+            {"bedrock": {"guardrail": {"guardrail_identifier": "gr-abc", "guardrail_version": "DRAFT", "trace": "enabled"}}}
         )
     )
     original_mtime = cfg_path.stat().st_mtime_ns
     _write_overlay(
         hermes_home,
         monkeypatch,
-        {"bedrock": {"guardrail": {"guardrail_identifier": "gr-abc", "guardrail_version": "DRAFT", "trace": "ENABLED"}}},
+        {"bedrock": {"guardrail": {"guardrail_identifier": "gr-abc", "guardrail_version": "DRAFT", "trace": "enabled"}}},
     )
     mod = _load_module()
     assert mod.main() == 0
@@ -242,15 +242,16 @@ def test_guardrail_idempotent_normalized_trace(hermes_home, monkeypatch):
 # ─── guardrail trace validation (compliance-critical, source-agnostic) ──────
 
 
-def test_guardrail_trace_normalized_to_uppercase(hermes_home, monkeypatch):
+def test_guardrail_trace_normalized_to_lowercase(hermes_home, monkeypatch):
+    """Converse's guardrailConfig.trace enum is lower-case; 'ENABLED' 400s ConverseStream."""
     _write_overlay(
         hermes_home,
         monkeypatch,
-        {"bedrock": {"guardrail": {"guardrail_identifier": "gr-abc", "guardrail_version": "DRAFT", "trace": "enabled"}}},
+        {"bedrock": {"guardrail": {"guardrail_identifier": "gr-abc", "guardrail_version": "DRAFT", "trace": "ENABLED"}}},
     )
     mod = _load_module()
     assert mod.main() == 0
-    assert _read_cfg(hermes_home)["bedrock"]["guardrail"]["trace"] == "ENABLED"
+    assert _read_cfg(hermes_home)["bedrock"]["guardrail"]["trace"] == "enabled"
 
 
 @pytest.mark.parametrize("value", ["ENABLED", "ENABLED_FULL", "DISABLED", "enabled_full", "disabled"])
@@ -262,7 +263,7 @@ def test_guardrail_trace_accepts_all_valid_values(hermes_home, monkeypatch, valu
     )
     mod = _load_module()
     assert mod.main() == 0
-    assert _read_cfg(hermes_home)["bedrock"]["guardrail"]["trace"] == value.upper()
+    assert _read_cfg(hermes_home)["bedrock"]["guardrail"]["trace"] == value.lower()
 
 
 @pytest.mark.parametrize("bad", ["on", "off", "true", "yes", "trace"])
@@ -298,7 +299,7 @@ def test_guardrail_trace_whitespace_stripped(hermes_home, monkeypatch):
     )
     mod = _load_module()
     assert mod.main() == 0
-    assert _read_cfg(hermes_home)["bedrock"]["guardrail"]["trace"] == "ENABLED"
+    assert _read_cfg(hermes_home)["bedrock"]["guardrail"]["trace"] == "enabled"
 
 
 def test_guardrail_trace_null_drops_key(hermes_home, monkeypatch):

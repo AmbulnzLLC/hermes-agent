@@ -30,3 +30,13 @@ def test_guardrail_intervened_invokemodel_reply_is_content_filter_not_model_text
     clean = SimpleNamespace(stop_reason="end_turn", content=[SimpleNamespace(type="text", text="hi")], model_extra={})
     assert transport.response_finish_reason(blocked) == "content_filter"
     assert transport.response_finish_reason(clean) == "stop"
+
+
+def test_converse_guardrail_trace_is_lowercased():
+    """Converse guardrailConfig.trace enum is lower-case; upper-case 'ENABLED' 400s ConverseStream."""
+    from agent.bedrock_adapter import bedrock_guardrail_config, bedrock_guardrail_headers
+    for raw, want in (("ENABLED", "enabled"), ("ENABLED_FULL", "enabled_full"), ("Disabled", "disabled")):
+        cfg = {"bedrock": {"guardrail": {"guardrail_identifier": "gr-1", "guardrail_version": "DRAFT", "trace": raw}}}
+        assert bedrock_guardrail_config(cfg)["trace"] == want
+    up = {"bedrock": {"guardrail": {"guardrail_identifier": "gr-1", "guardrail_version": "DRAFT", "trace": "ENABLED"}}}
+    assert bedrock_guardrail_headers(up)["X-Amzn-Bedrock-Trace"] == "ENABLED"
