@@ -94,7 +94,8 @@ RUN if [ "$HERMES_BOT_DESKTOP" = "1" ]; then \
         apt-get -o Acquire::Retries=3 update && \
         DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
         tigervnc-standalone-server xfce4-panel xfwm4 xfdesktop4 xfce4-settings xfce4-terminal \
-        dbus-x11 x11-xserver-utils x11-utils x11-xkb-utils xauth fonts-dejavu-core chromium && \
+        dbus-x11 x11-xserver-utils x11-utils x11-xkb-utils xauth fonts-dejavu-core chromium \
+        at-spi2-core && \
         rm -rf /var/lib/apt/lists/*; \
     fi
 
@@ -219,6 +220,14 @@ RUN set -eu; \
     "$browser_bin" --version; \
     mkdir -p /etc/hermes; \
     printf '%s' "$browser_bin" > /etc/hermes/agent-browser-executable-path
+
+# computer_use drives the Bot Screen through cua-driver (AT-SPI above). PM can't
+# install it at run time: the store is root-owned and rebuilt with the image.
+RUN set -eu; \
+    if [ "$HERMES_BOT_DESKTOP" = "1" ]; then \
+        cua_bin="$(python3 -c 'from pm import ensure, installed_package; ensure("cua-driver", explicit=True); print(installed_package("cua-driver").binary)')"; \
+        "$cua_bin" --version; \
+    fi
 
 # PM is resident too: never borrow application libraries or create its worker
 # environment under /root (unreachable to the runtime UID).
