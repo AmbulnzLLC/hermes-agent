@@ -404,6 +404,11 @@ sms = ["aiohttp==3.14.3"]
 teams = [
   "microsoft-teams-apps==2.0.13.4",
   "aiohttp==3.14.3",
+  # AmbulnzLLC fork: Graph for SharePoint channel uploads + hostedContents fallback
+  # (plugins/platforms/teams/graph.py, auth_graph.py import msgraph and msal directly).
+  "msgraph-sdk==1.64.0",
+  "msal==1.38.0",
+  "hermes-agent[azure-identity]",
 ] # aiohttp 3.14.3: prior CVEs + GHSA-cq5v-8q36-5273/GHSA-mfx4-hv73-q22v/GHSA-mq44-7p77-q5h7
 # Computer use talks to PM's pinned cua-driver over MCP stdio. This extra
 # provides the MCP client, independently of the native driver package.
