@@ -34,6 +34,7 @@ def _make_adapter() -> TeamsAdapter:
     a = TeamsAdapter.__new__(TeamsAdapter)
     a._app = MagicMock()
     a._conv_refs = {}
+    a._approval_previews = {}  # set by __init__ since upstream v0.23.0's card-preview cache
     # Note: TeamsAdapter.name is a read-only property, so we don't set it here.
     # The helper under test doesn't read self.name anyway.
     return a
