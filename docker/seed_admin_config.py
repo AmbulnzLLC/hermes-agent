@@ -53,7 +53,9 @@ import os
 import sys
 from pathlib import Path
 
-import yaml
+# Not PyYAML: the image stopped shipping it in 0.23, and stage2-hook.sh swallows
+# this script's failure, so a bare `import yaml` silently disabled the overlay.
+import hermes_yaml as yaml
 
 
 _DEFAULT_OVERLAY_PATH = "/config/overlay.yaml"

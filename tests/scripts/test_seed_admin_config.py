@@ -19,10 +19,12 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sys
 from pathlib import Path
 
 import pytest
-import yaml
+
+import hermes_yaml as yaml
 
 
 SCRIPT_PATH = Path(__file__).resolve().parents[2] / "docker" / "seed_admin_config.py"
@@ -373,3 +375,10 @@ def test_deep_merge_helper_unit():
     base = {"a": {"b": 1, "c": 2}, "d": [1, 2], "e": "old"}
     mod._deep_merge(base, {"a": {"c": 99, "x": 7}, "d": [3], "e": "new"})
     assert base == {"a": {"b": 1, "c": 99, "x": 7}, "d": [3], "e": "new"}
+
+
+def test_seeder_does_not_need_pyyaml(monkeypatch):
+    """The image ships no PyYAML; stage2-hook.sh swallows the ImportError, so the
+    overlay (model, guardrail, webapp) would silently stop applying."""
+    monkeypatch.setitem(sys.modules, "yaml", None)
+    _load_module()
