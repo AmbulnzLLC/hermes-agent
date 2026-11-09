@@ -45,6 +45,8 @@ def _ensure_teams_mock():
     microsoft_teams_cards = types.ModuleType("microsoft_teams.cards")
     microsoft_teams_apps_http = types.ModuleType("microsoft_teams.apps.http")
     microsoft_teams_apps_http_adapter = types.ModuleType("microsoft_teams.apps.http.adapter")
+    microsoft_teams_apps_activity_send = types.ModuleType("microsoft_teams.apps.activity_send")
+    microsoft_teams_apps_activity_send.send_or_update_activity = AsyncMock()
 
     # App class mock
     class MockApp:
@@ -167,6 +169,7 @@ def _ensure_teams_mock():
         "microsoft_teams.cards": microsoft_teams_cards,
         "microsoft_teams.apps.http": microsoft_teams_apps_http,
         "microsoft_teams.apps.http.adapter": microsoft_teams_apps_http_adapter,
+        "microsoft_teams.apps.activity_send": microsoft_teams_apps_activity_send,
     }.items():
         sys.modules.setdefault(name, mod)
 

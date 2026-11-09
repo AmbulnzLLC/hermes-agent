@@ -58,6 +58,7 @@ HttpRequest = HttpResponse = HttpRouteHandler = AdaptiveCard = ExecuteAction = T
 HttpMethod = str  # type: ignore[assignment,misc]
 # Fork additions: FileConsent (outbound files) + clarify-card choice inputs.
 FileConsentInvokeActivity = FileUploadInfo = Choice = ChoiceSetInput = None  # type: ignore[assignment,misc]
+send_or_update_activity = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
@@ -218,6 +219,8 @@ _SDK_IMPORTS = {
     # Fork-only: outbound FileConsent (OneDrive/SharePoint) delivery.
     "microsoft_teams.api.activities.invoke.file_consent": ("FileConsentInvokeActivity",),
     "microsoft_teams.api.models": ("FileUploadInfo",),
+    # Fork-only: sends through a stored ConversationReference (SDK 2.1 removed App.activity_sender).
+    "microsoft_teams.apps.activity_send": ("send_or_update_activity",),
     "microsoft_teams.api.models.adaptive_card": ("AdaptiveCardActionCardResponse", "AdaptiveCardActionMessageResponse"),
     "microsoft_teams.api.models.invoke_response": ("InvokeResponse", "AdaptiveCardInvokeResponse"),
     "microsoft_teams.apps.http.adapter": ("HttpMethod", "HttpRequest", "HttpResponse", "HttpRouteHandler"),
@@ -1175,7 +1178,7 @@ class TeamsAdapter(BasePlatformAdapter):
         """Send ``activity`` through the cached ConversationReference, else ``App.send(fallback)``."""
         conv_ref = self._conv_refs.get(chat_id)
         if conv_ref:
-            result = await self._app.activity_sender.send(activity, conv_ref)
+            result = await send_or_update_activity(self._app.api, activity, conv_ref)
         else:
             result = await self._app.send(chat_id, fallback)
         self._remember_sent(result)
@@ -1599,7 +1602,7 @@ class TeamsAdapter(BasePlatformAdapter):
             # never showed. Mirrors the conv_ref-first dispatch send_card/image/document use.
             conv_ref = self._conv_refs.get(chat_id)
             if conv_ref:
-                await self._app.activity_sender.send(TypingActivityInput(), conv_ref)
+                await send_or_update_activity(self._app.api, TypingActivityInput(), conv_ref)
             else:
                 await self._app.send(chat_id, TypingActivityInput())
 

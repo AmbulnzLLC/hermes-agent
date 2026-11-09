@@ -6,12 +6,13 @@ Covers:
 * DM dispatch via FileConsent card + ``_pending_uploads`` bookkeeping.
 * Channel dispatch via Graph SharePoint upload + FileDownload card.
 * ``_is_channel_chat`` heuristic — conv_ref override beats id-shape.
-* ``_send_attachment`` activity_sender vs send selection on conv_ref presence.
+* ``_send_attachment`` conv_ref vs ``App.send`` selection on conv_ref presence.
 
 The fixture builds a ``TeamsAdapter`` *without* calling ``connect()`` so we
 do not need the real SDK app, aiohttp listener, or MSAL credentials. The
-``self._app`` slot is filled with an ``AsyncMock`` whose ``send`` and
-``activity_sender.send`` methods record their arguments.
+``self._app`` slot is a mock spec'd against the real SDK ``App`` (so a removed SDK
+attribute fails here, not in production), and ``send_or_update_activity`` is patched
+to record conv_ref sends.
 """
 from __future__ import annotations
 
@@ -60,13 +61,15 @@ def adapter(monkeypatch) -> TeamsAdapter:
     )
     a = TeamsAdapter(cfg)
 
-    # Replace the SDK App with a Mock that has the two send entry points
-    # the adapter dispatches through.
-    fake_app = MagicMock()
+    from plugins.platforms.teams import adapter as _teams_mod
+    assert _teams_mod.check_teams_requirements()
+    # spec= the real App: SDK 2.1 removed App.activity_sender and an unspec'd mock hid it.
+    fake_app = MagicMock(spec=_teams_mod.App)
     fake_app.send = AsyncMock(return_value=Mock(id="sent-msg-id"))
-    fake_app.activity_sender = MagicMock()
-    fake_app.activity_sender.send = AsyncMock(return_value=Mock(id="conv-msg-id"))
+    fake_app.api = Mock(name="api")
     a._app = fake_app
+    a._conv_send = AsyncMock(return_value=Mock(id="conv-msg-id"))
+    monkeypatch.setattr(_teams_mod, "send_or_update_activity", a._conv_send)
     return a
 
 
@@ -286,7 +289,7 @@ def test_is_channel_chat_no_conv_ref_dm_shape_returns_false(adapter):
 
 
 # ---------------------------------------------------------------------------
-# _send_attachment dispatch — uses activity_sender when conv_ref present.
+# _send_attachment dispatch — uses the stored conv_ref when present.
 # ---------------------------------------------------------------------------
 
 
@@ -298,7 +301,9 @@ async def test_send_attachment_uses_conv_ref_when_available(adapter, doc_file):
     adapter._conv_refs[chat_id] = ref
     result = await adapter.send_document(chat_id, str(doc_file))
     assert result.success is True
-    adapter._app.activity_sender.send.assert_awaited_once()
+    adapter._conv_send.assert_awaited_once()
+    assert adapter._conv_send.await_args.args[0] is adapter._app.api
+    assert adapter._conv_send.await_args.args[2] is ref
     adapter._app.send.assert_not_awaited()
 
 
@@ -326,9 +331,10 @@ async def test_send_typing_uses_conv_ref_when_available(adapter):
 
     await adapter.send_typing(chat_id)
 
-    adapter._app.activity_sender.send.assert_awaited_once()
+    adapter._conv_send.assert_awaited_once()
     # The activity is a TypingActivityInput, and the stored ref is passed through.
-    sent_activity, sent_ref = adapter._app.activity_sender.send.await_args.args
+    sent_api, sent_activity, sent_ref = adapter._conv_send.await_args.args
+    assert sent_api is adapter._app.api
     assert isinstance(sent_activity, _teams_mod.TypingActivityInput)
     assert sent_ref is ref
     adapter._app.send.assert_not_awaited()
@@ -346,7 +352,7 @@ async def test_send_typing_falls_back_to_app_send_without_conv_ref(adapter):
     sent_chat_id, sent_activity = adapter._app.send.await_args.args
     assert sent_chat_id == chat_id
     assert isinstance(sent_activity, _teams_mod.TypingActivityInput)
-    adapter._app.activity_sender.send.assert_not_awaited()
+    adapter._conv_send.assert_not_awaited()
 
 
 @pytest.mark.asyncio
