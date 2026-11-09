@@ -88,6 +88,8 @@ def _install_fake_teams_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
     apps_http_adapter.HttpRequest = type("HttpRequest", (), {})
     apps_http_adapter.HttpResponse = type("HttpResponse", (), {})
     apps_http_adapter.HttpRouteHandler = type("HttpRouteHandler", (), {})
+    apps_activity_send = types.ModuleType("microsoft_teams.apps.activity_send")
+    apps_activity_send.send_or_update_activity = lambda *a, **k: None
 
     cards = types.ModuleType("microsoft_teams.cards")
     cards.AdaptiveCard = type("AdaptiveCard", (), {})
@@ -114,6 +116,7 @@ def _install_fake_teams_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
         "microsoft_teams.api.models.invoke_response": api_models_invoke,
         "microsoft_teams.apps.http": apps_http,
         "microsoft_teams.apps.http.adapter": apps_http_adapter,
+        "microsoft_teams.apps.activity_send": apps_activity_send,
         "microsoft_teams.cards": cards,
     }.items():
         monkeypatch.setitem(sys.modules, name, mod)
