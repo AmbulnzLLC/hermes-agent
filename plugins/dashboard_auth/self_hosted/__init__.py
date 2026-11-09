@@ -328,7 +328,9 @@ class SelfHostedOIDCProvider(JwtOAuthProvider):
         Called from ``_session`` — the chokepoint every Session flows through (login, refresh, and
         per-request ``verify_session``) — so removing a user takes effect on their next request.
         Matching is case-insensitive on ``preferred_username`` / ``email`` (plus the email
-        local-part). Only claims from an already signature/iss/aud-verified ID token reach here.
+        local-part). ``email`` counts only with ``email_verified: true``: an unverified address
+        is whatever the account holder typed. Only claims from an already signature/iss/aud-verified
+        ID token reach here.
         """
         if _ALLOW_ALL_SENTINEL in self._allowed_users:  # deliberate opt-out
             return
@@ -342,6 +344,8 @@ class SelfHostedOIDCProvider(JwtOAuthProvider):
                 "no allowed_users configured — this dashboard authorizes nobody until an allowlist is set")
         candidates = set()
         for claim in ("preferred_username", "email"):
+            if claim == "email" and claims.get("email_verified") is not True:
+                continue
             value = str(claims.get(claim, "") or "").strip().lower()
             if value:
                 candidates.add(value)

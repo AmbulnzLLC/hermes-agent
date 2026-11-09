@@ -93,6 +93,7 @@ def _mint_id_token(
     aud: str = _CLIENT_ID,
     sub: str = "usr_abc",
     email: str | None = "alice@example.com",
+    email_verified: bool | None = True,
     name: str | None = "Alice Example",
     groups: Any = None,
     org_id: str | None = None,
@@ -109,6 +110,8 @@ def _mint_id_token(
     }
     if email is not None:
         claims["email"] = email
+    if email is not None and email_verified is not None:
+        claims["email_verified"] = email_verified
     if name is not None:
         claims["name"] = name
     if groups is not None:
@@ -1028,6 +1031,23 @@ class TestAuthorizationEnforcement:
             rsa_keypair, allowed_users=["alice@example.com"]
         )
         id_token = _mint_id_token(rsa_keypair, email="alice@example.com")
+        assert isinstance(self._login(provider, id_token), Session)
+
+    @pytest.mark.parametrize("email_verified", [False, None, "true"])
+    def test_unverified_email_is_not_an_identity(self, rsa_keypair, email_verified):
+        """Only a literal email_verified: true lets the email claim match (absent, false and
+        the string "true" all deny): an unverified address is whatever the account holder typed."""
+        provider = _make_provider(rsa_keypair, allowed_users=["alice@example.com"])
+        id_token = _mint_id_token(rsa_keypair, email="alice@example.com", email_verified=None,
+                                  extra_claims=None if email_verified is None else {"email_verified": email_verified})
+        with pytest.raises(InvalidCodeError):
+            self._login(provider, id_token)
+        assert provider.verify_session(access_token=id_token) is None
+
+    def test_username_match_does_not_need_a_verified_email(self, rsa_keypair):
+        provider = _make_provider(rsa_keypair, allowed_users=["alice@example.com"])
+        id_token = _mint_id_token(rsa_keypair, email="alice@example.com", email_verified=False,
+                                  extra_claims={"preferred_username": "alice@example.com"})
         assert isinstance(self._login(provider, id_token), Session)
 
     def test_allowed_by_email_local_part(self, rsa_keypair):
